@@ -77,6 +77,7 @@ out="$(in_runtime "$soldier" 'head -1 /etc/os-release; python3 --version')"
 case "$out" in *soldier*"Python 3.7"*) report 0 soldier "$(echo "$out" | tr '\n' ' ')" ;; *) report 1 soldier "$out" ;; esac
 out="$(in_runtime "$sniper" 'head -1 /etc/os-release; python3 --version')"
 case "$out" in *sniper*"Python 3.9"*) report 0 sniper "$(echo "$out" | tr '\n' ' ')" ;; *) report 1 sniper "$out" ;; esac
+# shellcheck disable=SC2016  # expanded by the shell inside the container
 out="$(in_runtime "$scout" 'head -1 /etc/os-release; echo "STEAM_RUNTIME=$STEAM_RUNTIME"; ls "$STEAM_RUNTIME/pinned_libs_32" | head -1')"
 case "$out" in *soldier*STEAM_RUNTIME=/*pinned*|*soldier*STEAM_RUNTIME=/*lib*) report 0 scout "$(echo "$out" | tr '\n' ' ' | cut -c1-160)" ;; *) report 1 scout "$out" ;; esac
 
@@ -90,9 +91,12 @@ for arch in x86_64 i386; do
     case "$out" in *renderer*) report 0 "gl-$arch" "$out" ;; *) report 1 "gl-$arch" "$out" ;; esac
 done
 out="$(in_runtime "$sniper" "$helpers/x86_64-linux-gnu-check-vulkan 2>&1 | grep -c '\"can-draw\":true'")"
-[ "${out:-0}" -ge 1 ] 2>/dev/null; report $? vulkan "$out drawable device(s)"
+drawable=0; [ "${out:-0}" -ge 1 ] 2>/dev/null || drawable=1
+report "$drawable" vulkan "$out drawable device(s)"
 out="$(in_runtime "$sniper" "$helpers/i386-linux-gnu-check-vulkan 2>&1 | grep -c '\"can-draw\":true'")"
-[ "${out:-0}" -ge 1 ] 2>/dev/null; report $? vulkan-i386 "$out drawable device(s)"
+drawable=0; [ "${out:-0}" -ge 1 ] 2>/dev/null || drawable=1
+report "$drawable" vulkan-i386 "$out drawable device(s)"
+# shellcheck disable=SC2016  # expanded by the shell inside the container
 out="$(in_runtime "$sniper" 'xterm -e /bin/true; echo rc=$?')"
 case "$out" in *rc=0*) report 0 x11 "xterm ran" ;; *) report 1 x11 "$out" ;; esac
 
@@ -106,16 +110,18 @@ fi
 
 if [ -n "$wgltri" ]; then
     echo "== proton"
-    proton="$(ls -d "$HOME/Steam/compatibilitytools.d"/GE-Proton*/proton 2>/dev/null | head -1)"
+    proton="$(find "$HOME/Steam/compatibilitytools.d" -maxdepth 2 -name proton -path '*/GE-Proton*' 2>/dev/null | sort | head -1)"
     if [ -z "$proton" ]; then
         report 1 proton "no GE-Proton under $HOME/Steam/compatibilitytools.d"
     else
+        game_dir="$(dirname "$wgltri")"
+        tool_dir="$(dirname "$proton")"
         export STEAM_COMPAT_DATA_PATH="$HOME/Steam/steamapps/compatdata/999999"
         export STEAM_COMPAT_CLIENT_INSTALL_PATH="$HOME/Steam"
-        export STEAM_COMPAT_INSTALL_PATH="$(dirname "$wgltri")"
-        export STEAM_COMPAT_TOOL_PATHS="$(dirname "$proton"):$common/SteamLinuxRuntime_sniper"
+        export STEAM_COMPAT_INSTALL_PATH="$game_dir"
+        export STEAM_COMPAT_TOOL_PATHS="$tool_dir:$common/SteamLinuxRuntime_sniper"
         export STEAM_COMPAT_LIBRARY_PATHS="$HOME/Steam"
-        export STEAM_COMPAT_MOUNTS="$(dirname "$wgltri")"
+        export STEAM_COMPAT_MOUNTS="$game_dir"
         mkdir -p "$STEAM_COMPAT_DATA_PATH"
         cd "$(dirname "$wgltri")" || exit 2
         result="${wgltri%.exe}.txt"
@@ -135,7 +141,8 @@ if [ -n "$client" ]; then
         if xwininfo -root -tree 2>/dev/null | grep -q 'Sign in to Steam'; then found=yes; break; fi
         sleep 2
     done
-    [ -n "$found" ]; report $? client "sign-in window ${found:-not} present"
+    signed_in=1; [ -z "$found" ] || signed_in=0
+    report "$signed_in" client "sign-in window ${found:-not} present"
     "$client" -shutdown > /dev/null 2>&1
     for _ in $(seq 1 30); do pgrep -f 'ubuntu12_32/steam ' > /dev/null || break; sleep 2; done
 fi

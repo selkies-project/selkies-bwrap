@@ -1,0 +1,77 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+name: Checks
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    name: Python ${{ matrix.python }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The stand-in runs on whatever interpreter the image it is installed
+        # into has, so every version still receiving fixes is tested.
+        python: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Byte-compile
+        run: python -m py_compile selkies-bwrap
+      - name: Build a container and run a command in it
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y libfakechroot
+          # shellcheck disable=SC2016  # the shell inside the container expands these
+          SELKIES_BWRAP_BACKEND=fakechroot python selkies-bwrap \
+              --ro-bind /etc /etc --symlink usr/bin /bin --ro-bind /usr /usr \
+              --bind /proc /proc --dev-bind /dev /dev --bind /home /home \
+              --tmpfs /tmp --setenv CHECKED yes --chdir /usr \
+              /bin/sh -c 'test "$CHECKED" = yes && test "$(pwd)" = /usr && head -1 /etc/hostname'
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install ruff
+      - run: ruff check selkies-bwrap
+      - name: Shell scripts
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y shellcheck
+          sh -n install.sh
+          bash -n tests/steam-shim-check.sh
+          shellcheck install.sh tests/steam-shim-check.sh
+
+  windows-probe:
+    name: Windows OpenGL probe
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Cross-compile
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y gcc-mingw-w64-x86-64
+          x86_64-w64-mingw32-gcc -O2 -o tests/wgltri.exe tests/wgltri.c \
+              -lopengl32 -lgdi32 -luser32 -mconsole
+          file tests/wgltri.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wgltri
+          path: tests/wgltri.exe
