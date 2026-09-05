@@ -42,13 +42,15 @@ executor command line.
 
 import fcntl
 import hashlib
-import json
 import os
 import shutil
 import signal
-import subprocess
 import sys
 import tempfile
+
+# json and subprocess are imported where they are used. Every Steam container
+# launch runs this several times before anything starts, and neither module is
+# needed on the path that a launch actually takes.
 
 VERSION = "bubblewrap 0.9.0 (selkies-bwrap)"
 PROGRAM = "selkies-bwrap"
@@ -257,6 +259,8 @@ def proot_candidates():
 
 def proot_works(path):
     """Whether this proot can trace a process here: run true through it."""
+    import subprocess
+
     try:
         completed = subprocess.run([path, "/bin/true"], stdin=subprocess.DEVNULL,
                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -649,6 +653,8 @@ def libdl_lib_tokens(helpers):
     on the host here, since pv-adverb's own attempt goes through fakechroot's
     dlopen, which cannot expand loader tokens.
     """
+    import subprocess
+
     tokens = {}
     for tuple_ in ("x86_64-linux-gnu", "i386-linux-gnu"):
         helper = os.path.join(helpers, tuple_ + "-detect-lib")
@@ -937,6 +943,8 @@ class Runner:
             except OSError as error:
                 log(f"execve {executable}: {error}")
             os._exit(127)
+        if self.info_fds or self.status_fds:
+            import json
         for fd in self.info_fds + self.status_fds:
             try:
                 os.write(fd, (json.dumps({"child-pid": pid}) + "\n").encode())
@@ -960,6 +968,7 @@ class Runner:
                 continue
         for fd in self.status_fds:
             try:
+                import json
                 os.write(fd, (json.dumps({"exit-code": os.waitstatus_to_exitcode(status)}) + "\n").encode())
             except (OSError, ValueError):
                 pass
