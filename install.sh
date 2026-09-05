@@ -14,10 +14,13 @@
 # steamdeps, the client's dependency check, would drive apt through pkexec at
 # every start; the system carries what it checks for, so it is diverted to a
 # stub that answers that everything is there. selkies-bwrap is installed
-# beside this script's copy, or downloaded from the repository when run alone.
+# beside this script's copy, or downloaded from the repository when run alone,
+# and Steam's own launcher is diverted so that every way of starting Steam --
+# the menu entry, a steam:// link, a shell -- names it. Without that, Steam's
+# requirements check finds no working bubblewrap and refuses to start with
+# "Steam now requires user namespaces to be enabled".
 #
-# Run as root, or under fakeroot in a rootless image build. Set BWRAP to the
-# installed path in the environment Steam starts from (see README.md).
+# Run as root, or under fakeroot in a rootless image build.
 
 set -eu
 
@@ -78,6 +81,23 @@ else
     chmod 755 "${prefix}/bin/selkies-bwrap"
 fi
 
+# The launcher is a symbolic link to the client's own script; diverting it
+# leaves the package free to update the script, and an already-set BWRAP wins
+# so that a session can still choose another one. The client reads its own
+# package name out of argv[0] and refuses to start under any other, so the
+# replacement passes the original name on.
+if [ ! -e /usr/bin/steam.distrib ]; then
+    dpkg-divert --rename --divert /usr/bin/steam.distrib /usr/bin/steam
+fi
+cat > /usr/bin/steam <<EOF
+#!/bin/bash
+# Start Steam with a bubblewrap that works without user namespaces.
+BWRAP="\${BWRAP:-${prefix}/bin/selkies-bwrap}"
+export BWRAP
+exec -a steam /usr/bin/steam.distrib "\$@"
+EOF
+chmod 755 /usr/bin/steam
+
 apt-get clean
 rm -rf /var/lib/apt/lists/*
-echo "selkies-bwrap installed at ${prefix}/bin/selkies-bwrap; export BWRAP=${prefix}/bin/selkies-bwrap where Steam starts"
+echo "selkies-bwrap installed at ${prefix}/bin/selkies-bwrap and wired into /usr/bin/steam"

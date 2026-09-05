@@ -35,22 +35,21 @@ sudo ./install.sh
 
 The script adds Valve's repository through Steam's own launcher package, installs
 the Steam client with the 32-bit libraries the client and games need, installs
-fakechroot, and puts `selkies-bwrap` in `/usr/local/bin`. Then, in the environment
-Steam starts from:
+fakechroot, puts `selkies-bwrap` in `/usr/local/bin`, and diverts `/usr/bin/steam`
+so that every way of starting Steam names it: the menu entry, a `steam://` link, a
+shell. Nothing else to set. `$BWRAP` still wins where a session sets it.
 
-```bash
-export BWRAP="/usr/local/bin/selkies-bwrap"
-```
+That last part is what keeps Steam from stopping at its own requirements check,
+which refuses to start with "Steam now requires user namespaces to be enabled" when
+it can find no working bubblewrap.
 
-In a container image, put that in the image's environment so every way of starting
-Steam carries it. In the Selkies desktop images
+In the Selkies desktop images
 ([GLX](https://github.com/selkies-project/docker-selkies-glx-desktop),
 [EGL](https://github.com/selkies-project/docker-selkies-egl-desktop)) the layer is:
 
 ```dockerfile
 ARG SELKIES_BWRAP_REF="main"
 RUN curl -fsSL "https://raw.githubusercontent.com/selkies-project/selkies-bwrap/${SELKIES_BWRAP_REF}/install.sh" | sh
-ENV BWRAP="/usr/local/bin/selkies-bwrap"
 ```
 
 Those images already ship a PRoot that carries `CAP_SYS_PTRACE`
