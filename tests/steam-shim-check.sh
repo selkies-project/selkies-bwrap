@@ -127,7 +127,7 @@ if [ -n "$wgltri" ]; then
         result="${wgltri%.exe}.txt"
         rm -f "$result"
         timeout 900 "$common/SteamLinuxRuntime_sniper/_v2-entry-point" --verb=waitforexitandrun -- "$proton" waitforexitandrun "$wgltri" 300 > "$HOME/proton-check.log" 2>&1
-        out="$(cat "$result" 2>/dev/null | tr '\n' ' ')"
+        out="$(tr '\n' ' ' < "$result" 2>/dev/null)"
         case "$out" in *GL_RENDERER*frames:*) report 0 proton "$out" ;; *) report 1 proton "${out:-$(grep -E 'wine: |Error|error' "$HOME/proton-check.log" | grep -vE "$quiet" | head -2 | tr '\n' ' ')}" ;; esac
         cd - > /dev/null || true
     fi
@@ -137,12 +137,18 @@ if [ -n "$client" ]; then
     echo "== steam client"
     setsid "$client" > "$HOME/steam-client-check.log" 2>&1 &
     found=""
-    for _ in $(seq 1 90); do
-        if xwininfo -root -tree 2>/dev/null | grep -q 'Sign in to Steam'; then found=yes; break; fi
+    # A cold client downloads and unpacks itself before the browser helper
+    # draws anything, which takes minutes on a slow host.
+    for _ in $(seq 1 180); do
+        tree="$(xwininfo -root -tree 2>/dev/null)"
+        case "$tree" in
+            *"Sign in to Steam"*) found="sign-in window"; break ;;
+            *"not responding"*) found=""; break ;;
+        esac
         sleep 2
     done
     signed_in=1; [ -z "$found" ] || signed_in=0
-    report "$signed_in" client "sign-in window ${found:-not} present"
+    report "$signed_in" client "${found:-no sign-in window}"
     "$client" -shutdown > /dev/null 2>&1
     for _ in $(seq 1 30); do pgrep -f 'ubuntu12_32/steam ' > /dev/null || break; sleep 2; done
 fi
