@@ -54,7 +54,8 @@ ENV BWRAP="/usr/local/bin/selkies-bwrap"
 ```
 
 Those images already ship a PRoot that carries `CAP_SYS_PTRACE`
-(`/opt/proot-apps-cap/proot`), which `selkies-bwrap` finds on its own.
+(`/opt/proot-apps-cap/proot`), which `selkies-bwrap` finds on its own when it needs
+it.
 
 ## How it works
 
@@ -63,32 +64,42 @@ links, generated files, environment edits, and the command to run. `selkies-bwra
 reads that description, builds the tree it describes as a real directory under
 `$XDG_RUNTIME_DIR`, and hands the result to one of two executors.
 
-**PRoot**, when the host allows `ptrace`. Every bind mount becomes a PRoot binding
-and the tree is the guest root, which is a faithful container: a program sees the
-paths bubblewrap would have given it, whatever it does with them. PRoot's seccomp
-filter leaves syscalls without a path argument untraced, so a game's frame loop
-runs at full speed.
+**fakechroot** is the default. An `LD_PRELOAD` library prefixes every path a
+dynamically linked program opens, and bind mounts become symbolic links in the tree.
+The dynamic loader and the kernel are not rewritten, so what they follow has to
+resolve on the host as well: library search paths are given as tree paths, absolute
+symlink targets inside the runtime copy are prefixed, per-architecture preload
+modules are paired under one `$LIB` path, and the runtime's `ld.so.cache`
+regeneration is replaced by a complete `LD_LIBRARY_PATH`. A bind of a host path at
+its own name is passed through untranslated, which is what lets `readlink -f` and
+`realpath` agree with the kernel. The container runs on the host's glibc in this
+mode, which is what pressure-vessel picks anyway whenever the host's is newer than
+the runtime's.
 
-**fakechroot**, when `ptrace` is denied — a host with
-`kernel.yama.ptrace_scope=2` and no `CAP_SYS_PTRACE`. An `LD_PRELOAD` library
-prefixes every path a dynamically linked program opens, and bind mounts become
-symbolic links in the tree. The dynamic loader and the kernel are not rewritten, so
-what they follow has to resolve on the host as well: library search paths are given
-as tree paths, absolute symlink targets inside the runtime copy are prefixed,
-per-architecture preload modules are paired under one `$LIB` path, and the runtime's
-`ld.so.cache` regeneration is replaced by a complete `LD_LIBRARY_PATH`. A bind of a
-host path at its own name is passed through untranslated, which is what lets
-`readlink -f` and `realpath` agree with the kernel. The container runs on the host's
-glibc in this mode, which is what pressure-vessel picks anyway whenever the host's
-is newer than the runtime's.
+**PRoot** takes over where the fakechroot library is missing, and is available
+through `SELKIES_BWRAP_BACKEND=proot`. Every bind mount becomes a PRoot binding and
+the tree is the guest root, which confines paths for every process rather than only
+those that go through libc — the right answer for a program that bypasses it. Its
+`ptrace` needs a host that allows tracing: `kernel.yama.ptrace_scope` below 2, or
+`CAP_SYS_PTRACE`.
 
-The tree is named for what the container is, not for when it started, because a
-Wine prefix records the container's root as the path behind its `Z:` drive and every
-later launch reuses it.
+fakechroot leads because of the Steam client. Both executors run games, Proton and
+the runtime containers, and they cost the same to within a few per cent, but the
+client's browser helper is a Chromium that never answers the client's watchdog under
+PRoot. Measured on a bare-metal host where all three work: the sign-in window
+appears 8 seconds after launch under fakechroot and 18 under real bubblewrap, while
+PRoot reaches "Steamwebhelper is not responding" instead.
+
+The tree is named for what the container is, not for when it started, because a Wine
+prefix records the container's root as the path behind its `Z:` drive and every later
+launch reuses it. That path differs between the executors, so the drive is repointed
+at the root of whichever one is running: a prefix built under one stays usable under
+the other. This is the only place where the stand-in knows anything about Steam.
 
 Two environment variables steer it, and neither is needed in normal use:
 `SELKIES_BWRAP_BACKEND` forces `proot` or `fakechroot`, and `SELKIES_BWRAP_DEBUG`
-prints the executor's command line.
+prints the executor's command line. `SELKIES_BWRAP_PROOT` names a PRoot binary to
+use instead of the ones found on the system.
 
 ## Proton
 

@@ -279,21 +279,31 @@ def fakechroot_libraries():
 
 
 def choose_backend():
-    """Pick the executor: proot where ptrace works, fakechroot otherwise."""
+    """Pick the executor: fakechroot, or proot where its library is missing.
+
+    Both run everything a game needs, and cost the same to within a few per
+    cent; the Steam client is what separates them. Its browser helper is a
+    Chromium that never answers the client's watchdog under proot, while under
+    fakechroot the sign-in window is up in seconds, so fakechroot leads and
+    proot is what a host without the library falls back to. proot confines
+    paths for every process rather than only those that go through libc, which
+    is why `SELKIES_BWRAP_BACKEND=proot` stays available for a program that
+    bypasses it.
+    """
     forced = os.environ.get("SELKIES_BWRAP_BACKEND", "").strip().lower()
     if forced not in ("", "proot", "fakechroot"):
         raise UsageError("SELKIES_BWRAP_BACKEND must be proot or fakechroot")
-    if forced != "fakechroot":
-        for path in proot_candidates():
-            if proot_works(path):
-                return "proot", path
-            debug(f"{path} cannot trace processes here")
-        if forced == "proot":
-            raise UsageError("no working proot: ptrace is denied here")
-    libraries = fakechroot_libraries()
-    if not libraries:
-        raise UsageError("neither proot can trace here nor is libfakechroot.so installed")
-    return "fakechroot", libraries
+    if forced != "proot":
+        libraries = fakechroot_libraries()
+        if libraries:
+            return "fakechroot", libraries
+        if forced == "fakechroot":
+            raise UsageError("libfakechroot.so is not installed")
+    for path in proot_candidates():
+        if proot_works(path):
+            return "proot", path
+        debug(f"{path} cannot trace processes here")
+    raise UsageError("neither libfakechroot.so is installed nor can proot trace here")
 
 
 class Root:
@@ -814,6 +824,7 @@ class Runner:
         """Materialize the tree and return the executor's argv, env and cwd."""
         root = Root(self.stage, self.backend == "fakechroot")
         root.apply(self.ops)
+        self.repoint_wine_drive(root)
         for path in self.lock_files:
             fd = os.open(root.path + path, os.O_RDONLY | os.O_CLOEXEC)
             fcntl.lockf(fd, fcntl.LOCK_SH)
@@ -863,6 +874,29 @@ class Runner:
             command = [self.argv0] + command[1:]
         cwd = root.translate(self.cwd) if self.cwd else None
         return executable, command, env, cwd
+
+    def repoint_wine_drive(self, root):
+        """Point a Wine prefix's Z: drive at this container's root.
+
+        Wine records the container's root as the Unix path behind Z: when it
+        creates a prefix, and every later launch reuses what it recorded.
+        That path is the tree under fakechroot and `/` under proot, so a prefix
+        one executor created leaves the other unable to reach the game. The
+        drive is rewritten to whatever this launch's root is, which is
+        Steam-specific knowledge, and the only knowledge of Steam here.
+        """
+        data = self.env.get("STEAM_COMPAT_DATA_PATH")
+        if not data:
+            return
+        drive = os.path.join(data, "pfx", "dosdevices", "z:")
+        wanted = root.path if self.backend == "fakechroot" else "/"
+        try:
+            if os.readlink(drive).rstrip("/") == wanted.rstrip("/"):
+                return
+            os.unlink(drive)
+            os.symlink(wanted, drive)
+        except OSError as error:
+            debug(f"leaving {drive} alone: {error}")
 
     def run(self):
         """Fork the executor, wait for it and mirror its exit like bwrap."""
