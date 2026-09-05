@@ -348,8 +348,20 @@ class Root:
         it created inside the container reaches the tree root first, since
         fakechroot prefixes the targets it writes, and the kernel then walks
         on from there.
+
+        The root directory is the exception. Excluding it would exclude only
+        itself, since a pass-through path matches at a directory boundary, so
+        the host's own top-level entries are linked into the tree instead and
+        the container becomes the host filesystem, which is what binding the
+        root asks for.
         """
         dest = os.path.normpath(dest)
+        if dest == "/":
+            for name in os.listdir("/"):
+                here = os.path.join(self.path, name)
+                if not os.path.lexists(here):
+                    os.symlink("/" + name, here)
+            return
         if self.excluded_path(dest):
             return
         self.excluded.append(dest)
@@ -865,10 +877,18 @@ class Runner:
         if "/" in executable:
             executable = root.translate(os.path.join(self.cwd or "/", executable))
         else:
-            for directory in (env.get("PATH") or os.defpath).split(":"):
-                candidate = root.translate(os.path.join(directory, executable))
-                if os.access(candidate, os.X_OK):
-                    executable = candidate
+            # A bare name is looked up in the tree first and on the host
+            # second, so that a container assembled entirely out of
+            # pass-through binds still finds its command.
+            for translate in (root.translate, lambda path: path):
+                found = None
+                for directory in (env.get("PATH") or os.defpath).split(":"):
+                    candidate = translate(os.path.join(directory, executable))
+                    if os.access(candidate, os.X_OK):
+                        found = candidate
+                        break
+                if found is not None:
+                    executable = found
                     break
         if self.argv0:
             command = [self.argv0] + command[1:]

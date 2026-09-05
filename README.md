@@ -128,6 +128,29 @@ program is built from `tests/wgltri.c` with a MinGW cross compiler:
 x86_64-w64-mingw32-gcc -O2 -o tests/wgltri.exe tests/wgltri.c -lopengl32 -lgdi32 -luser32 -mconsole
 ```
 
+## What this replaces
+
+Steam in a namespace-less container has been worked around before, and each
+workaround gave something up:
+
+- **Patching the runtime's `_v2-entry-point`** to skip pressure-vessel and run the
+  game directly against the host's libraries. Proton worked; native Linux games did
+  not, because they are built against the runtime and need it. Steam also verifies
+  the runtime against its own `mtree` manifest and re-extracts it, which is what the
+  "copy the file while Steam is starting" and live-patcher tricks were for.
+- **A `(no runtime)` compatibility tool** pointing straight at `proton`, for the same
+  reason and with the same limits. Proton runs through the ordinary Steam Linux
+  Runtime here, so the extra `compatibilitytool.vdf` and `toolmanifest.vdf` pairs are
+  no longer needed.
+- **Deleting `/run/host/container-manager` and `/run/systemd/container`**, which makes
+  Steam's requirements check believe it is already inside pressure-vessel and skip
+  testing bubblewrap. The check passes for real here: it probes with
+  `bwrap --bind / / true`, and the stand-in answers it.
+
+`steamdeps` is still worth neutralizing, and the installer does: the client's
+dependency check would otherwise drive `apt` through `pkexec` at every start, so
+there is also no need to point `pkexec` at `sudo`.
+
 ## What it is not
 
 This is a compatibility shim, not a security boundary. The container it builds

@@ -82,19 +82,22 @@ else
 fi
 
 # The launcher is a symbolic link to the client's own script; diverting it
-# leaves the package free to update the script, and an already-set BWRAP wins
-# so that a session can still choose another one. The client reads its own
-# package name out of argv[0] and refuses to start under any other, so the
-# replacement passes the original name on.
+# leaves the package free to update that script, and an already-set BWRAP wins
+# so that a session can still choose another one. The client takes its package
+# name from the name it was started as and refuses to run under any other, and
+# a shell script cannot be given a different one -- the kernel hands the
+# interpreter the script's own path -- so the replacement starts it through a
+# link that is still called `steam`.
+ln -sfn bin_steam.sh /usr/lib/steam/steam
 if [ ! -e /usr/bin/steam.distrib ]; then
     dpkg-divert --rename --divert /usr/bin/steam.distrib /usr/bin/steam
 fi
 cat > /usr/bin/steam <<EOF
-#!/bin/bash
+#!/bin/sh
 # Start Steam with a bubblewrap that works without user namespaces.
 BWRAP="\${BWRAP:-${prefix}/bin/selkies-bwrap}"
 export BWRAP
-exec -a steam /usr/bin/steam.distrib "\$@"
+exec /usr/lib/steam/steam "\$@"
 EOF
 chmod 755 /usr/bin/steam
 

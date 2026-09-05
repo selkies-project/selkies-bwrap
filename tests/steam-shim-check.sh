@@ -72,6 +72,11 @@ echo "== backend"
 out="$(SELKIES_BWRAP_DEBUG=1 "$BWRAP" --ro-bind / / /bin/true 2>&1 | grep -o 'backend [a-z]*')"
 report $? shim "$out"
 
+# The command line Steam's own requirements check probes with, which has to
+# work or the client refuses to start at all.
+"$BWRAP" --bind / / true
+report $? probe "steam-runtime-check-requirements probe"
+
 echo "== containers"
 out="$(in_runtime "$soldier" 'head -1 /etc/os-release; python3 --version')"
 case "$out" in *soldier*"Python 3.7"*) report 0 soldier "$(echo "$out" | tr '\n' ' ')" ;; *) report 1 soldier "$out" ;; esac
