@@ -1,0 +1,964 @@
+#!/usr/bin/python3
+
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+"""bubblewrap stand-in for pressure-vessel on hosts without user namespaces.
+
+Steam runs its client helper and every game through pressure-vessel, which
+builds a bwrap(1) command line describing a container -- bind mounts, symlinks,
+generated files, environment edits and the command to run -- and executes it.
+bwrap needs a user namespace or CAP_SYS_ADMIN, and a container's default
+seccomp profile grants neither, so pressure-vessel fails at that very last step.
+pressure-vessel consults ``$BWRAP`` when its bundled bwrap does not work; this
+program takes that place, accepts the same command line and runs the command
+in an equivalent tree without namespaces.
+
+The bwrap description is materialized as a root directory under the runtime
+directory, one per launch: ``--dir``, ``--symlink``, ``--tmpfs`` and the data
+file options become real entries, and the bind mounts are handed to one of two
+executors.
+
+* proot, when the host allows ptrace: every bind is a proot ``-b`` binding and
+  the root directory is the guest root, which is a faithful container. proot's
+  seccomp filter leaves syscalls without a path argument untraced, so a game's
+  frame loop runs at native speed.
+* fakechroot, when ptrace is denied (Yama scope 2 without CAP_SYS_PTRACE): an
+  LD_PRELOAD library prefixes every path a dynamically linked program opens
+  with the root directory, and binds become symlinks in it. The dynamic loader
+  and the kernel are not rewritten, so what they follow must resolve on the
+  host: library search paths are given as root-prefixed host paths, absolute
+  symlink targets inside the root are prefixed with it, and the ld.so cache
+  regeneration is replaced by a complete LD_LIBRARY_PATH. The host's glibc is
+  what the container runs on in this mode, which pressure-vessel already
+  chooses whenever the host's is newer than the runtime's.
+
+Real bubblewrap is used whenever it works: pressure-vessel tries its own copy
+first and reads ``$BWRAP`` only after that fails. ``SELKIES_BWRAP_BACKEND``
+forces ``proot`` or ``fakechroot``; ``SELKIES_BWRAP_DEBUG`` prints the
+executor command line.
+"""
+
+import fcntl
+import hashlib
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+
+VERSION = "bubblewrap 0.9.0 (selkies-bwrap)"
+PROGRAM = "selkies-bwrap"
+
+# Options with no argument: namespace and capability requests have no
+# meaning without namespaces and are accepted for compatibility.
+FLAGS = {
+    "--unshare-all", "--share-net", "--unshare-user", "--unshare-user-try",
+    "--unshare-ipc", "--unshare-pid", "--unshare-net", "--unshare-uts",
+    "--unshare-cgroup", "--unshare-cgroup-try", "--disable-userns",
+    "--assert-userns-disabled", "--clearenv", "--new-session",
+    "--die-with-parent", "--as-pid-1", "--level-prefix",
+    "--not-a-security-boundary",
+}
+ONE_ARG = {
+    "--args", "--argv0", "--userns", "--userns2", "--pidns", "--uid", "--gid",
+    "--hostname", "--chdir", "--unsetenv", "--lock-file", "--sync-fd",
+    "--remount-ro", "--exec-label", "--file-label", "--proc", "--dev",
+    "--tmpfs", "--mqueue", "--dir", "--seccomp", "--add-seccomp-fd",
+    "--block-fd", "--userns-block-fd", "--info-fd", "--json-status-fd",
+    "--cap-add", "--cap-drop", "--perms", "--size", "--tmp-overlay",
+    "--ro-overlay", "--overlay-src",
+}
+TWO_ARGS = {
+    "--setenv", "--bind", "--bind-try", "--dev-bind", "--dev-bind-try",
+    "--ro-bind", "--ro-bind-try", "--bind-fd", "--ro-bind-fd", "--file",
+    "--bind-data", "--ro-bind-data", "--symlink", "--chmod",
+}
+THREE_ARGS = {"--overlay"}
+BINDS = {"--bind", "--bind-try", "--dev-bind", "--dev-bind-try", "--ro-bind",
+         "--ro-bind-try", "--bind-fd", "--ro-bind-fd"}
+DATA_FILES = {"--file", "--bind-data", "--ro-bind-data"}
+# Options that create the next filesystem entry, which --perms applies to.
+CREATES = {"--dir", "--tmpfs", "--symlink"} | DATA_FILES
+
+HELP = f"""usage: {PROGRAM} [OPTIONS...] [--] COMMAND [ARGS...]
+
+bubblewrap-compatible front end that runs COMMAND in the described tree
+through proot or fakechroot instead of namespaces. Accepted options:
+"""
+
+
+class UsageError(Exception):
+    """A command line bubblewrap itself would reject."""
+
+
+def log(message):
+    sys.stderr.write(f"{PROGRAM}: {message}\n")
+    sys.stderr.flush()
+
+
+def debug(message):
+    if os.environ.get("SELKIES_BWRAP_DEBUG"):
+        log(message)
+
+
+def read_fd(fd):
+    """Read an inherited descriptor to its end, from its current position."""
+    chunks = []
+    while True:
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+
+
+def parse(argv):
+    """Turn bubblewrap's command line into ordered operations and a command.
+
+    Returns:
+        A tuple of (operations, command): operations are
+        (option, arguments, perms) triples in command-line order, perms being
+        the octal mode a preceding ``--perms`` requested for entries that
+        option creates, or None.
+
+    Raises:
+        UsageError: on an unknown option or a missing argument.
+    """
+    args = list(argv)
+    ops = []
+    perms = None
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--":
+            i += 1
+            break
+        if not arg.startswith("--"):
+            break
+        if arg == "--args":
+            if i + 1 >= len(args):
+                raise UsageError("--args takes an argument")
+            fd = int(args[i + 1])
+            spliced = [a.decode("utf-8", "surrogateescape")
+                       for a in read_fd(fd).split(b"\0") if a]
+            os.close(fd)
+            args[i:i + 2] = spliced
+            continue
+        if arg in FLAGS:
+            count = 0
+        elif arg in ONE_ARG:
+            count = 1
+        elif arg in TWO_ARGS:
+            count = 2
+        elif arg in THREE_ARGS:
+            count = 3
+        else:
+            raise UsageError(f"Unknown option {arg}")
+        if i + count >= len(args):
+            raise UsageError(f"{arg} takes {count} argument(s)")
+        values = args[i + 1:i + 1 + count]
+        i += 1 + count
+        if arg == "--perms":
+            perms = int(values[0], 8)
+            continue
+        ops.append((arg, values, perms if arg in CREATES else None))
+        if arg in CREATES:
+            perms = None
+    command = args[i:]
+    return ops, command
+
+
+def runtime_base():
+    """The per-user directory that holds one root tree per launch."""
+    base = os.environ.get("XDG_RUNTIME_DIR")
+    if not base or not os.access(base, os.W_OK):
+        base = os.path.join(tempfile.gettempdir(), f"{PROGRAM}-{os.getuid()}")
+        os.makedirs(base, 0o700, exist_ok=True)
+    base = os.path.join(base, PROGRAM)
+    os.makedirs(base, 0o700, exist_ok=True)
+    return base
+
+
+def stage_directory(base, ops):
+    """The directory this launch builds its root in, named for the container.
+
+    The name is derived from what the container is rather than from when it
+    started, because a Wine prefix records the container's root as the path
+    behind its Z: drive and is reused by every later launch: a directory named
+    per launch would leave that drive dangling. The same container therefore
+    comes back to the same directory, and one that is still in use gets a
+    fresh directory beside it.
+
+    Returns:
+        A path whose directory is empty and exists.
+    """
+    key = hashlib.sha256()
+    copy = runtime_copy(ops)
+    if copy is not None:
+        key.update(os.path.dirname(os.path.dirname(copy)).encode())
+    for option, values, _ in ops:
+        if option in BINDS or option in ("--dir", "--tmpfs", "--symlink") or option in DATA_FILES:
+            key.update(b"\0" + option.encode() + b"\0" + values[-1].encode())
+    path = os.path.join(base, key.hexdigest()[:16])
+    if in_use(path):
+        path = tempfile.mkdtemp(prefix=os.path.basename(path) + ".", dir=base)
+    else:
+        shutil.rmtree(path, ignore_errors=True)
+        os.makedirs(path, 0o700)
+    with open(os.path.join(path, "pid"), "w") as f:
+        f.write(f"{os.getpid()}\n")
+    return path
+
+
+def in_use(path):
+    """Whether the process that built this root directory is still running."""
+    try:
+        with open(os.path.join(path, "pid")) as f:
+            pid = int(f.read().strip() or "0")
+    except (OSError, ValueError):
+        return False
+    if pid <= 0 or pid == os.getpid():
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    return True
+
+
+def collect_garbage(base):
+    """Remove the trees of launches whose supervisor is gone."""
+    for name in os.listdir(base):
+        path = os.path.join(base, name)
+        if os.path.isdir(path) and not in_use(path):
+            shutil.rmtree(path, ignore_errors=True)
+
+
+def proot_candidates():
+    """proot executables to try, best first."""
+    override = os.environ.get("SELKIES_BWRAP_PROOT")
+    if override:
+        yield override
+        return
+    home = os.path.expanduser("~")
+    for path in (os.path.join(home, ".local", "bin", "proot"),
+                 "/opt/proot-apps-cap/proot", "/opt/proot-apps/proot"):
+        if os.access(path, os.X_OK):
+            yield path
+    found = shutil.which("proot")
+    if found:
+        yield found
+
+
+def proot_works(path):
+    """Whether this proot can trace a process here: run true through it."""
+    try:
+        completed = subprocess.run([path, "/bin/true"], stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                   timeout=30, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return completed.returncode == 0
+
+
+def fakechroot_libraries():
+    """The fakechroot preload library per multiarch tuple, or an empty dict."""
+    found = {}
+    for tuple_ in ("x86_64-linux-gnu", "i386-linux-gnu", "aarch64-linux-gnu"):
+        for prefix in ("/usr/lib", "/usr/local/lib"):
+            path = os.path.join(prefix, tuple_, "fakechroot", "libfakechroot.so")
+            if os.path.exists(path):
+                found[tuple_] = path
+                break
+    return found
+
+
+def choose_backend():
+    """Pick the executor: proot where ptrace works, fakechroot otherwise."""
+    forced = os.environ.get("SELKIES_BWRAP_BACKEND", "").strip().lower()
+    if forced not in ("", "proot", "fakechroot"):
+        raise UsageError("SELKIES_BWRAP_BACKEND must be proot or fakechroot")
+    if forced != "fakechroot":
+        for path in proot_candidates():
+            if proot_works(path):
+                return "proot", path
+            debug(f"{path} cannot trace processes here")
+        if forced == "proot":
+            raise UsageError("no working proot: ptrace is denied here")
+    libraries = fakechroot_libraries()
+    if not libraries:
+        raise UsageError("neither proot can trace here nor is libfakechroot.so installed")
+    return "fakechroot", libraries
+
+
+class Root:
+    """The container root as a directory tree, built from bubblewrap operations.
+
+    Attributes:
+        path: The tree's top directory.
+        binds: (source, destination) pairs for the proot executor, in order.
+    """
+
+    def __init__(self, stage, fakechroot):
+        self.stage = stage
+        self.path = os.path.join(stage, "root")
+        self.fakechroot = fakechroot
+        self.binds = []
+        self.excluded = ["/dev", "/proc", "/sys"]
+        self.counter = 0
+        os.mkdir(self.path, 0o755)
+
+    def excluded_path(self, dest):
+        """Whether a container path lies in a tree fakechroot passes through.
+
+        A bind of a host path at its own path is one fakechroot need not
+        translate at all, and must not: a symlink in the tree pointing at the
+        same path would send every program that canonicalizes paths itself,
+        such as ``readlink -f``, round in circles.
+        """
+        dest = os.path.normpath(dest)
+        return any(dest == e or dest.startswith(e + "/") for e in self.excluded)
+
+    def translate(self, path):
+        """The host path fakechroot would open for a container path."""
+        if self.excluded_path(path):
+            return path
+        return self.path + os.path.normpath(path)
+
+    def pass_through(self, dest):
+        """Let fakechroot pass a host path through at its own name.
+
+        The name is excluded from translation, and the tree still gets a
+        symlink to the host path: a program that follows an absolute symlink
+        it created inside the container reaches the tree root first, since
+        fakechroot prefixes the targets it writes, and the kernel then walks
+        on from there.
+        """
+        dest = os.path.normpath(dest)
+        if self.excluded_path(dest):
+            return
+        self.excluded.append(dest)
+        here = self.place(dest)
+        if not os.path.lexists(here):
+            os.symlink(dest, here)
+
+    def scratch(self, kind):
+        """A fresh path under the stage for a tmpfs directory or a data file."""
+        self.counter += 1
+        directory = os.path.join(self.stage, kind)
+        os.makedirs(directory, 0o700, exist_ok=True)
+        return os.path.join(directory, str(self.counter))
+
+    def host_reference(self, link):
+        """Whether a symlink in the tree points at the host rather than the tree."""
+        target = os.readlink(link)
+        return target.startswith("/") and not target.startswith(self.path + "/")
+
+    def mirror(self, link):
+        """Replace a symlink to a host directory with a directory of symlinks.
+
+        A bind is a symlink under fakechroot, so an entry placed inside a bound
+        directory would otherwise be written into the host directory itself.
+        One level of symlinks keeps the host's entries visible while the tree
+        gains its own.
+        """
+        target = os.readlink(link)
+        entries = os.listdir(target)
+        os.unlink(link)
+        os.mkdir(link, 0o755)
+        for entry in entries:
+            os.symlink(os.path.join(target, entry), os.path.join(link, entry))
+
+    def place(self, dest):
+        """Resolve a container path to its tree path, owning every parent.
+
+        Symlinks the operations created are followed inside the tree; a
+        fakechroot bind on the way is mirrored so the parent is a directory of
+        the tree's own.
+
+        Returns:
+            The tree path at which the entry for ``dest`` belongs.
+        """
+        parts = [p for p in dest.split("/") if p and p != "."]
+        current = self.path
+        for name in parts[:-1]:
+            nxt = os.path.join(current, name)
+            while os.path.islink(nxt):
+                if self.host_reference(nxt):
+                    if not self.fakechroot:
+                        break
+                    self.mirror(nxt)
+                    break
+                target = os.readlink(nxt)
+                if target.startswith("/"):
+                    nxt = os.path.normpath(target)
+                else:
+                    nxt = os.path.normpath(os.path.join(current, target))
+            if not os.path.lexists(nxt):
+                os.mkdir(nxt, 0o755)
+            current = nxt
+        return os.path.join(current, parts[-1]) if parts else current
+
+    def remove(self, path):
+        """Drop an entry of the tree's own without following it."""
+        if os.path.islink(path) or not os.path.isdir(path):
+            os.unlink(path)
+        else:
+            shutil.rmtree(path)
+
+    def bind(self, option, source, dest):
+        """Apply a bind mount operation."""
+        if option.endswith("-fd"):
+            source = os.readlink(f"/proc/self/fd/{int(source)}")
+        if not os.path.lexists(source):
+            if option.endswith("-try"):
+                return
+            raise UsageError(f"Can't find source path {source}")
+        if self.fakechroot:
+            if os.path.normpath(source) == os.path.normpath(dest):
+                self.pass_through(dest)
+                return
+            if self.excluded_path(dest):
+                log(f"cannot bind {source} over {dest}, which fakechroot passes through")
+                return
+            here = self.place(dest)
+            if os.path.lexists(here):
+                self.remove(here)
+            os.symlink(source, here)
+            return
+        self.placeholder(dest, os.path.isdir(source))
+        self.binds.append((source, dest))
+
+    def placeholder(self, dest, is_dir):
+        """Give a proot binding a mount point.
+
+        A binding needs its guest path to exist: in the tree, or, when an
+        earlier binding already covers the path, inside that binding's source
+        if it is a tmpfs directory of the tree's own. A host directory covering
+        it is left alone, and proot glues the mount point in itself.
+        """
+        covering = None
+        for source, bound in self.binds:
+            if ((dest == bound or dest.startswith(bound.rstrip("/") + "/"))
+                    and (covering is None or len(bound) > len(covering[1]))):
+                covering = (source, bound)
+        if covering is None:
+            here = self.place(dest)
+        elif covering[0].startswith(self.stage + "/"):
+            here = os.path.join(covering[0], os.path.relpath(dest, covering[1]))
+            os.makedirs(os.path.dirname(here), exist_ok=True)
+        else:
+            return
+        if os.path.lexists(here):
+            return
+        if is_dir:
+            os.mkdir(here, 0o755)
+        else:
+            open(here, "w").close()
+
+    def tmpfs(self, dest, perms):
+        """An empty directory of the tree's own, masking whatever was there."""
+        if self.fakechroot:
+            if self.excluded_path(dest):
+                debug(f"not masking {dest} inside a tree fakechroot passes through")
+                return
+            here = self.place(dest)
+            if os.path.lexists(here):
+                self.remove(here)
+            os.mkdir(here, perms if perms is not None else 0o755)
+            return
+        scratch = self.scratch("tmpfs")
+        os.mkdir(scratch, perms if perms is not None else 0o755)
+        self.placeholder(dest, True)
+        self.binds.append((scratch, dest))
+
+    def directory(self, dest, perms):
+        if self.fakechroot and self.excluded_path(dest):
+            if not os.path.isdir(dest):
+                debug(f"not creating {dest} inside a tree fakechroot passes through")
+            return
+        here = self.place(dest)
+        if os.path.isdir(here):
+            if perms is not None and not os.path.islink(here):
+                os.chmod(here, perms)
+            return
+        os.mkdir(here, perms if perms is not None else 0o755)
+
+    def symlink(self, target, dest):
+        if self.fakechroot and self.excluded_path(dest):
+            debug(f"not linking {dest} inside a tree fakechroot passes through")
+            return
+        here = self.place(dest)
+        if os.path.lexists(here):
+            if os.path.islink(here) and os.readlink(here) == target:
+                return
+            self.remove(here)
+        if self.fakechroot and target.startswith("/"):
+            target = self.path + target
+        os.symlink(target, here)
+
+    def data_file(self, option, fd, dest, perms):
+        """Write an inherited descriptor's content at a container path."""
+        content = read_fd(int(fd))
+        os.close(int(fd))
+        mode = perms if perms is not None else 0o644
+        if self.fakechroot and self.excluded_path(dest):
+            log(f"cannot place {dest} inside a tree fakechroot passes through")
+            return
+        if self.fakechroot or option == "--file":
+            here = self.place(dest)
+            if os.path.lexists(here):
+                self.remove(here)
+            with open(os.open(here, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode), "wb") as f:
+                f.write(content)
+            os.chmod(here, mode)
+            return
+        scratch = self.scratch("data")
+        with open(os.open(scratch, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode), "wb") as f:
+            f.write(content)
+        os.chmod(scratch, mode)
+        self.placeholder(dest, False)
+        self.binds.append((scratch, dest))
+
+    def apply(self, ops):
+        """Apply the filesystem operations in order; the rest is for the runner."""
+        for option, values, perms in ops:
+            if option in BINDS:
+                self.bind(option, values[0], values[1])
+            elif option in ("--proc", "--dev"):
+                self.bind("--dev-bind", "/" + option[2:], values[0])
+            elif option == "--tmpfs":
+                self.tmpfs(values[0], perms)
+            elif option in ("--dir", "--mqueue"):
+                self.directory(values[0], perms)
+            elif option == "--symlink":
+                self.symlink(values[0], values[1])
+            elif option in DATA_FILES:
+                self.data_file(option, values[0], values[1], perms)
+            elif option == "--chmod":
+                os.chmod(self.place(values[1]), int(values[0], 8))
+            elif option in ("--overlay", "--tmp-overlay", "--ro-overlay", "--overlay-src"):
+                raise UsageError(f"{option} is not supported here")
+
+    def prefix_absolute_symlinks(self, directory):
+        """Point a mutable runtime copy's absolute symlinks into the tree.
+
+        pressure-vessel edits its copy of the runtime in place, linking host
+        libraries as ``/run/host/...`` and runtime files by their container
+        path. The kernel resolves a symlink target on the host, so under
+        fakechroot every absolute target gets the tree prefix, which the
+        preload library strips again when a program reads the link.
+        """
+        for parent, dirs, files in os.walk(directory):
+            for name in dirs + files:
+                link = os.path.join(parent, name)
+                if not os.path.islink(link):
+                    continue
+                target = os.readlink(link)
+                if target.startswith("/") and not target.startswith(self.path + "/"):
+                    os.unlink(link)
+                    os.symlink(self.path + target, link)
+
+
+def runtime_copy(ops):
+    """The mutable runtime copy bound at /usr, if pressure-vessel made one.
+
+    pressure-vessel's ``--copy-runtime`` places it at ``var/tmp-XXXXXX`` under
+    its variable directory and edits it in place; the shared runtime under
+    ``files/`` has no absolute symlinks and is never touched.
+    """
+    for option, values, _ in ops:
+        if option in BINDS and values[1] == "/usr":
+            copy = os.path.dirname(values[0])
+            if (os.path.basename(copy).startswith("tmp-")
+                    and os.path.basename(os.path.dirname(copy)) == "var"
+                    and os.access(copy, os.W_OK)):
+                return copy
+    return None
+
+
+def ld_so_conf_dirs(root):
+    """Library directories the container's ld.so.conf names, in order."""
+    dirs = []
+
+    def read(path, depth=0):
+        if depth > 8:
+            return
+        try:
+            with open(path) as f:
+                lines = f.read().splitlines()
+        except OSError:
+            return
+        for line in lines:
+            line = line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            if line.startswith("include "):
+                pattern = line[len("include "):].strip()
+                if not pattern.startswith("/"):
+                    pattern = os.path.join(os.path.dirname(path), pattern)
+                import glob
+                for match in sorted(glob.glob(root + pattern)):
+                    read(match, depth + 1)
+            elif line.startswith("/") and line not in dirs:
+                dirs.append(line)
+
+    read(root + "/etc/ld.so.conf")
+    for tuple_ in ("x86_64-linux-gnu", "i386-linux-gnu"):
+        for prefix in ("/lib", "/usr/lib"):
+            path = os.path.join(prefix, tuple_)
+            if path not in dirs:
+                dirs.append(path)
+    for path in ("/lib", "/usr/lib", "/usr/local/lib"):
+        if path not in dirs:
+            dirs.append(path)
+    return dirs
+
+
+def libdl_lib_tokens(helpers):
+    """What the dynamic loader expands ``$LIB`` to, per multiarch tuple.
+
+    pressure-vessel ships a helper per architecture that reports it; they run
+    on the host here, since pv-adverb's own attempt goes through fakechroot's
+    dlopen, which cannot expand loader tokens.
+    """
+    tokens = {}
+    for tuple_ in ("x86_64-linux-gnu", "i386-linux-gnu"):
+        helper = os.path.join(helpers, tuple_ + "-detect-lib")
+        if not os.access(helper, os.X_OK):
+            continue
+        try:
+            completed = subprocess.run([helper], stdout=subprocess.PIPE,
+                                       stderr=subprocess.DEVNULL, timeout=30, check=False)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        token = completed.stdout.decode(errors="replace").strip()
+        if completed.returncode == 0 and token:
+            tokens[tuple_] = token
+    return tokens
+
+
+def merge_preload_modules(modules, root, tokens):
+    """One loader-expanded path per module name, for a set of per-ABI modules.
+
+    pv-adverb pairs a 32-bit and a 64-bit copy of a module into a single
+    ``${PLATFORM}`` entry once it knows the loader's tokens, which it cannot
+    learn under fakechroot. The same pairing is done here with ``$LIB``: each
+    copy is linked under the tree by its architecture's library directory, and
+    the loader picks the right one for every process.
+
+    Args:
+        modules: (option, path, tuple) triples from ``--ld-preload=PATH:abi=T``
+            and ``--ld-audit`` arguments.
+
+    Returns:
+        The replacement adverb arguments.
+    """
+    directory = os.path.join(root.stage, "modules")
+    groups = {}
+    for option, path, tuple_ in modules:
+        groups.setdefault((option, os.path.basename(path)), []).append((path, tuple_))
+    out = []
+    for (option, base), copies in groups.items():
+        if len(copies) < 2 or any(t not in tokens for _, t in copies):
+            out.extend(f"{option}={path}:abi={tuple_}" for path, tuple_ in copies)
+            continue
+        for path, tuple_ in copies:
+            where = os.path.join(directory, tokens[tuple_])
+            os.makedirs(where, exist_ok=True)
+            link = os.path.join(where, base)
+            if os.path.lexists(link):
+                os.unlink(link)
+            os.symlink(root.path + path if path.startswith("/") else path, link)
+        out.append("{}={}".format(option, os.path.join(directory, "$LIB", base)))
+    return out
+
+
+def adjust_adverb(command, root, libraries):
+    """Rewrite pv-adverb's arguments for fakechroot.
+
+    ldconfig is statically linked, so the cache it would regenerate is neither
+    written nor read here; the search path it stood for becomes a complete
+    LD_LIBRARY_PATH of tree paths instead. Preload modules become paths the
+    dynamic loader can follow on the host, and the fakechroot library itself is
+    added as a module so pv-adverb keeps it in the LD_PRELOAD it composes for
+    the game.
+
+    Returns:
+        The rewritten command, and the LD_LIBRARY_PATH pv-adverb itself runs
+        with.
+    """
+    if not command or os.path.basename(command[0]) != "pv-adverb":
+        return command, None
+    tokens = libdl_lib_tokens(root.path + os.path.dirname(command[0]))
+    prefixed = []
+    aliases = None
+    modules = []
+    out = [command[0]]
+    i = 1
+    while i < len(command):
+        arg = command[i]
+        if arg == "--":
+            break
+        if arg == "--regenerate-ld.so-cache":
+            i += 2
+            continue
+        if arg == "--add-ld.so-path":
+            prefixed.append(command[i + 1])
+            i += 2
+            continue
+        if arg == "--set-ld-library-path":
+            aliases = command[i + 1]
+            i += 2
+            continue
+        if arg.startswith(("--ld-preload=", "--ld-audit=")) and ":abi=" in arg:
+            option, value = arg.split("=", 1)
+            path, tuple_ = value.rsplit(":abi=", 1)
+            modules.append((option, path, tuple_))
+            i += 1
+            continue
+        if arg.startswith(("--ld-preload=/", "--ld-audit=/")):
+            option, value = arg.split("=", 1)
+            arg = f"{option}={root.path}{value}"
+        out.append(arg)
+        i += 1
+    search = list(prefixed)
+    if aliases:
+        search.extend(p for p in aliases.split(":") if p and p not in search)
+    search.extend(p for p in ld_so_conf_dirs(root.path) if p not in search)
+    library_path = ":".join(root.path + p for p in search)
+    out.extend(["--set-ld-library-path", library_path])
+    out.extend(merge_preload_modules(modules, root, tokens))
+    out.append("--ld-preload=" + fakechroot_preload(root, libraries))
+    out.extend(command[i:])
+    return out, library_path
+
+
+def fakechroot_preload(root, libraries):
+    """The LD_PRELOAD entry loading fakechroot into either architecture.
+
+    The dynamic loader expands ``$LIB`` to the multiarch library directory,
+    so one path serves 64-bit and 32-bit programs when both libraries sit at
+    the same place under it; otherwise only the primary library is named.
+    """
+    directory = os.path.join(root.stage, "preload")
+    os.makedirs(directory, exist_ok=True)
+    common = None
+    for tuple_, path in libraries.items():
+        marker = f"/{tuple_}/"
+        if marker in path:
+            form = path.replace(marker, "/$LIB/", 1).replace("/usr/lib/$LIB/", "/usr/$LIB/", 1)
+            if common is None:
+                common = form
+            elif common != form:
+                common = False
+    if common and len(libraries) > 1:
+        return common
+    return libraries.get("x86_64-linux-gnu") or next(iter(libraries.values()))
+
+
+class Runner:
+    """Executes the command in the tree and supervises it like bwrap would."""
+
+    def __init__(self, ops, command, backend, detail, stage):
+        self.ops = ops
+        self.command = command
+        self.backend = backend
+        self.detail = detail
+        self.stage = stage
+        self.env = dict(os.environ)
+        self.cwd = None
+        self.argv0 = None
+        self.new_session = False
+        self.die_with_parent = False
+        self.info_fds = []
+        self.status_fds = []
+        self.keep_fds = []
+        self.lock_files = []
+        self.locks = []
+        for option, values, _ in ops:
+            if option == "--setenv":
+                self.env[values[0]] = values[1]
+            elif option == "--unsetenv":
+                self.env.pop(values[0], None)
+            elif option == "--clearenv":
+                self.env = {}
+            elif option == "--chdir":
+                self.cwd = values[0]
+            elif option == "--argv0":
+                self.argv0 = values[0]
+            elif option == "--new-session":
+                self.new_session = True
+            elif option == "--die-with-parent":
+                self.die_with_parent = True
+            elif option == "--info-fd":
+                self.info_fds.append(int(values[0]))
+            elif option == "--json-status-fd":
+                self.status_fds.append(int(values[0]))
+            elif option == "--sync-fd":
+                self.keep_fds.append(int(values[0]))
+            elif option == "--lock-file":
+                self.lock_files.append(values[0])
+            elif option in ("--seccomp", "--add-seccomp-fd", "--block-fd",
+                            "--userns-block-fd", "--userns", "--userns2", "--pidns"):
+                if option == "--block-fd":
+                    read_fd(int(values[0]))
+                os.close(int(values[0]))
+
+    def build(self):
+        """Materialize the tree and return the executor's argv, env and cwd."""
+        root = Root(self.stage, self.backend == "fakechroot")
+        root.apply(self.ops)
+        for path in self.lock_files:
+            fd = os.open(root.path + path, os.O_RDONLY | os.O_CLOEXEC)
+            fcntl.lockf(fd, fcntl.LOCK_SH)
+            self.locks.append(fd)
+        if self.backend == "proot":
+            return self.build_proot(root)
+        return self.build_fakechroot(root)
+
+    def build_proot(self, root):
+        argv = [self.detail, "-r", root.path]
+        for source, dest in root.binds:
+            argv.extend(["-b", f"{source}:{dest}"])
+        if self.cwd:
+            argv.extend(["-w", self.cwd])
+        argv.extend(self.command)
+        return self.detail, argv, self.env, None
+
+    def build_fakechroot(self, root):
+        libraries = self.detail
+        copy = runtime_copy(self.ops)
+        if copy:
+            root.prefix_absolute_symlinks(copy)
+        command, library_path = adjust_adverb(self.command, root, libraries)
+        env = dict(self.env)
+        env["FAKECHROOT_BASE"] = root.path
+        if len(root.excluded) >= 99:
+            log("more than 99 pass-through paths; fakechroot ignores the rest")
+        env["FAKECHROOT_EXCLUDE_PATH"] = ":".join([root.path] + root.excluded[:99])
+        env.pop("FAKECHROOT", None)
+        env["LD_PRELOAD"] = fakechroot_preload(root, libraries)
+        if library_path is not None:
+            env["LD_LIBRARY_PATH"] = library_path
+        elif "LD_LIBRARY_PATH" in env:
+            env["LD_LIBRARY_PATH"] = ":".join(
+                root.path + p if p.startswith("/") else p
+                for p in env["LD_LIBRARY_PATH"].split(":") if p)
+        executable = command[0]
+        if "/" in executable:
+            executable = root.translate(os.path.join(self.cwd or "/", executable))
+        else:
+            for directory in (env.get("PATH") or os.defpath).split(":"):
+                candidate = root.translate(os.path.join(directory, executable))
+                if os.access(candidate, os.X_OK):
+                    executable = candidate
+                    break
+        if self.argv0:
+            command = [self.argv0] + command[1:]
+        cwd = root.translate(self.cwd) if self.cwd else None
+        return executable, command, env, cwd
+
+    def run(self):
+        """Fork the executor, wait for it and mirror its exit like bwrap."""
+        executable, argv, env, cwd = self.build()
+        env["PWD"] = self.cwd or "/"
+        debug("executing {}: {}".format(executable, " ".join(repr(a) for a in argv)))
+        if self.die_with_parent:
+            set_pdeathsig(signal.SIGKILL)
+        pid = os.fork()
+        if pid == 0:
+            try:
+                if self.new_session:
+                    os.setsid()
+                set_pdeathsig(signal.SIGKILL)
+                if cwd:
+                    os.chdir(cwd)
+                os.execve(executable, argv, env)
+            except OSError as error:
+                log(f"execve {executable}: {error}")
+            os._exit(127)
+        for fd in self.info_fds + self.status_fds:
+            try:
+                os.write(fd, (json.dumps({"child-pid": pid}) + "\n").encode())
+            except OSError:
+                pass
+        forwarded = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGUSR1, signal.SIGUSR2)
+
+        def forward(signum, _frame):
+            try:
+                os.kill(pid, signum)
+            except ProcessLookupError:
+                pass
+
+        for signum in forwarded:
+            signal.signal(signum, forward)
+        while True:
+            try:
+                _, status = os.waitpid(pid, 0)
+                break
+            except InterruptedError:
+                continue
+        for fd in self.status_fds:
+            try:
+                os.write(fd, (json.dumps({"exit-code": os.waitstatus_to_exitcode(status)}) + "\n").encode())
+            except (OSError, ValueError):
+                pass
+        return status
+
+
+def set_pdeathsig(signum):
+    """Ask the kernel to deliver signum when the parent process dies."""
+    try:
+        import ctypes
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.prctl(1, signum, 0, 0, 0)
+    except (OSError, AttributeError):
+        pass
+
+
+def main(argv):
+    if len(argv) == 1 or argv[1] == "--help":
+        sys.stdout.write(HELP)
+        for name in sorted(FLAGS | ONE_ARG | TWO_ARGS | THREE_ARGS):
+            sys.stdout.write(f"    {name}\n")
+        return 0
+    if argv[1] == "--version":
+        print(VERSION)
+        return 0
+    try:
+        ops, command = parse(argv[1:])
+        if not command:
+            raise UsageError("COMMAND is required")
+        backend, detail = choose_backend()
+    except UsageError as error:
+        log(str(error))
+        return 1
+    base = runtime_base()
+    collect_garbage(base)
+    stage = stage_directory(base, ops)
+    debug(f"backend {backend}, tree {stage}")
+    try:
+        runner = Runner(ops, command, backend, detail, stage)
+        status = runner.run()
+    except UsageError as error:
+        log(str(error))
+        shutil.rmtree(stage, ignore_errors=True)
+        return 1
+    finally:
+        pass
+    shutil.rmtree(stage, ignore_errors=True)
+    if os.WIFSIGNALED(status):
+        signal.signal(os.WTERMSIG(status), signal.SIG_DFL)
+        os.kill(os.getpid(), os.WTERMSIG(status))
+        return 128 + os.WTERMSIG(status)
+    return os.WEXITSTATUS(status)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
