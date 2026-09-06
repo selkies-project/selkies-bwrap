@@ -98,8 +98,13 @@ for name in ${patches}; do
     rm -f "/tmp/${name}.patch"
 done
 
-make -C "${srcdir}/src" -j"$(nproc)" proot GIT=false
-install -m 755 "${srcdir}/src/proot" "${prefix}/bin/proot"
+# Best-effort: where proot cannot be built, proot-bwrap runs every container
+# under the fakechroot installed above rather than the install failing here.
+if make -C "${srcdir}/src" -j"$(nproc)" proot GIT=false; then
+    install -m 755 "${srcdir}/src/proot" "${prefix}/bin/proot"
+else
+    echo "warning: proot did not build, so containers run under fakechroot" >&2
+fi
 rm -rf "${srcdir}"
 # shellcheck disable=SC2086  # likewise
 [ -z "${tools}" ] || { apt-get purge -y ${tools} && apt-get autoremove -y --purge; }
