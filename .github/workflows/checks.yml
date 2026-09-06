@@ -56,8 +56,20 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y shellcheck
           sh -n install.sh
-          bash -n tests/steam-shim-check.sh
-          shellcheck install.sh tests/steam-shim-check.sh
+          bash -n tests/steam-shim-check.sh tests/proot-check.sh
+          shellcheck install.sh tests/steam-shim-check.sh tests/proot-check.sh
+
+  proot:
+    name: proot
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build the patched proot and ask it its own name
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+              gcc libc6-dev make patch libtalloc-dev
+          tests/proot-check.sh
 
   windows-probe:
     name: Windows OpenGL probe
