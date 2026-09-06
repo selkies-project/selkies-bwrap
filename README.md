@@ -59,9 +59,11 @@ falls back to this one.
   program's own name; `proot-bwrap` prefers such a build, and says which it
   picked under `PROOT_BWRAP_DEBUG=1`.
 - **The Steam client wants fakechroot.** Both runtimes, both architectures,
-  games and Proton run under either backend, but the client's browser helper
-  only ever answers its watchdog under fakechroot, so that one leads.
-  `PROOT_BWRAP_BACKEND=proot` chooses the other anyway.
+  games and Proton run under either backend, but the client gives its browser
+  helper about ten seconds to answer and proot costs roughly twice as much for
+  every process started, which is enough to miss it. Nothing is broken there:
+  the same "Steamwebhelper is not responding" appears under fakechroot on a
+  machine slowed by that factor. `PROOT_BWRAP_BACKEND=proot` chooses it anyway.
 - **This is not a security boundary.** It confines paths, not privileges; the
   surrounding container is the boundary, as it already is for the browsers
   those images run with `--no-sandbox`.

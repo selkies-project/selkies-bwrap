@@ -330,10 +330,11 @@ def choose_backend():
 
     Both run everything a game needs, and cost the same to within a few per
     cent of a game's own work, though proot pays about twice as much for every
-    process started. The Steam client is what separates them. Its browser helper is a
-    Chromium that never answers the client's watchdog under proot, while under
-    fakechroot the sign-in window is up in seconds, so fakechroot leads and
-    proot is what a host without the library falls back to. proot confines
+    process started. The Steam client is what separates them: it gives its
+    browser helper about ten seconds to answer, and that factor is enough to
+    miss it -- the same "not responding" appears under fakechroot on a machine
+    slowed as much -- so fakechroot leads and proot is what a host without the
+    library falls back to. proot confines
     paths for every process rather than only those that go through libc, which
     is why `PROOT_BWRAP_BACKEND=proot` stays available for a program that
     bypasses it.
