@@ -31,11 +31,10 @@ become real entries, and the bind mounts are handed to one of two executors.
 * proot, where that library is missing: every bind is a proot ``-b`` binding
   and the root directory is the guest root, which confines paths for every
   process rather than only those that go through libc. It needs ptrace, and it
-  replaces argv[0] with its loader, which breaks a multi-call binary that reads
-  argv[0] to decide what it is -- the coreutils of Ubuntu 25.10 and later are
-  one, so nothing that runs them works under proot on such a host. Inside the
-  Steam runtimes, which are Debian-based, they are separate binaries and it
-  does work.
+  loads a program through a loader of its own, whose temp file every released
+  proot leaves named in AT_EXECFN -- the multi-call coreutils of Ubuntu 25.10
+  and later read that to decide which tool they are, so nothing that runs them
+  works under such a build. A proot is probed for that before it is used.
 
 Real bubblewrap is used whenever it works: pressure-vessel tries its own copy
 first and reads ``$BWRAP`` only after that fails. ``PROOT_BWRAP_BACKEND``
@@ -260,17 +259,58 @@ def proot_candidates():
         yield found
 
 
-def proot_works(path):
-    """Whether this proot can trace a process here: run true through it."""
+# Reads AT_EXECFN the way a program does: through prctl(PR_GET_AUXV), and
+# through /proc/self/auxv on the kernels older than 6.4 that have no such
+# prctl.
+EXECFN_PROBE = """\
+import ctypes, struct, sys
+width = struct.calcsize('P')
+form = 'Q' if width == 8 else 'I'
+vector = b''
+try:
+    buffer = ctypes.create_string_buffer(4096)
+    if ctypes.CDLL(None).prctl(0x41555856, buffer, len(buffer), 0, 0) > 0:
+        vector = buffer.raw
+except (OSError, AttributeError, ValueError):
+    pass
+if not vector:
+    with open('/proc/self/auxv', 'rb') as handle:
+        vector = handle.read()
+for start in range(0, len(vector) - 2 * width + 1, 2 * width):
+    key, value = struct.unpack(form * 2, vector[start:start + 2 * width])
+    if key == 0:
+        break
+    if key == 31 and value:
+        sys.stdout.write(ctypes.string_at(value).decode('utf-8', 'replace'))
+        break
+"""
+
+
+def proot_state(path):
+    """What this proot is good for here: "none", "traces" or "names".
+
+    Tracing is the first question. The second is whose name a traced program
+    finds in AT_EXECFN, since a proot that leaves its own loader there breaks
+    every applet of a multi-call coreutils, which is what Ubuntu 25.10 and
+    later ship: the name is what they dispatch on.
+    """
     import subprocess
 
-    try:
-        completed = subprocess.run([path, "/bin/true"], stdin=subprocess.DEVNULL,
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                   timeout=30, check=False)
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return completed.returncode == 0
+    def run(argv, capture):
+        try:
+            return subprocess.run(argv, stdin=subprocess.DEVNULL,
+                                  stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
+                                  stderr=subprocess.DEVNULL, timeout=60, check=False)
+        except (OSError, subprocess.SubprocessError):
+            return None
+
+    completed = run([path, sys.executable, "-c", EXECFN_PROBE], True)
+    if completed is not None and completed.returncode == 0:
+        name = completed.stdout.decode("utf-8", "replace").strip()
+        return "names" if name == sys.executable else "traces"
+
+    completed = run([path, "/bin/true"], False)
+    return "traces" if completed is not None and completed.returncode == 0 else "none"
 
 
 def fakechroot_libraries():
@@ -289,7 +329,8 @@ def choose_backend():
     """Pick the executor: fakechroot, or proot where its library is missing.
 
     Both run everything a game needs, and cost the same to within a few per
-    cent; the Steam client is what separates them. Its browser helper is a
+    cent of a game's own work, though proot pays about twice as much for every
+    process started. The Steam client is what separates them. Its browser helper is a
     Chromium that never answers the client's watchdog under proot, while under
     fakechroot the sign-in window is up in seconds, so fakechroot leads and
     proot is what a host without the library falls back to. proot confines
@@ -306,10 +347,18 @@ def choose_backend():
             return "fakechroot", libraries
         if forced == "fakechroot":
             raise UsageError("libfakechroot.so is not installed")
+    fallback = None
     for path in proot_candidates():
-        if proot_works(path):
+        state = proot_state(path)
+        if state == "names":
             return "proot", path
-        debug(f"{path} cannot trace processes here")
+        if state == "traces":
+            debug(f"{path} leaves its own loader named in AT_EXECFN")
+            fallback = fallback or path
+        else:
+            debug(f"{path} cannot trace processes here")
+    if fallback is not None:
+        return "proot", fallback
     raise UsageError("neither libfakechroot.so is installed nor can proot trace here")
 
 

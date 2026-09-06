@@ -43,20 +43,25 @@ symbolic links, generated files, and the command to run. `proot-bwrap` reads
 that description, builds the tree it describes under `$XDG_RUNTIME_DIR`, and
 runs the command in it with [fakechroot](https://github.com/dex4er/fakechroot),
 which redirects the paths a program opens instead of creating a namespace.
-[PRoot](https://proot-me.github.io/) is used instead where the fakechroot
-library is missing.
+[PRoot](https://proot-me.github.io/), which traces every process rather than
+only what goes through libc, runs a program the fakechroot library cannot be
+preloaded into.
 
 Real bubblewrap is still preferred: Steam tries its own copy first and only
 falls back to this one.
 
 ## Notes
 
-- **PRoot cannot run modern Ubuntu's userland.** Ubuntu 25.10 and later ship
-  coreutils as one multi-call binary that decides which tool it is from
-  `argv[0]`, and PRoot replaces `argv[0]` with its loader, so every `cp`, `ls`
-  and `dirname` fails with `coreutils: unknown program`. PRoot is fine inside
-  the Steam runtimes, which are Debian-based, but fakechroot is the default for
-  this reason. `PROOT_BWRAP_BACKEND=proot` forces it anyway.
+- **PRoot has to be a recent build.** Every released one leaves its own loader
+  named in `AT_EXECFN`, and the multi-call coreutils of Ubuntu 25.10 and later
+  reads that to decide which tool it is, so `cp`, `ls` and `dirname` fail with
+  `coreutils: unknown program`. The installer builds one that answers with the
+  program's own name; `proot-bwrap` prefers such a build, and says which it
+  picked under `PROOT_BWRAP_DEBUG=1`.
+- **The Steam client wants fakechroot.** Both runtimes, both architectures,
+  games and Proton run under either backend, but the client's browser helper
+  only ever answers its watchdog under fakechroot, so that one leads.
+  `PROOT_BWRAP_BACKEND=proot` chooses the other anyway.
 - **This is not a security boundary.** It confines paths, not privileges; the
   surrounding container is the boundary, as it already is for the browsers
   those images run with `--no-sandbox`.

@@ -10,15 +10,18 @@
 # itself registers, together with the 32-bit host libraries the 32-bit client
 # and games need and the libraries Steam's metapackages only recommend but
 # games reach for (Vulkan, EGL, video acceleration and XKB of both
-# architectures). fakechroot is installed for the hosts that deny ptrace.
-# steamdeps, the client's dependency check, would drive apt through pkexec at
-# every start; the system carries what it checks for, so it is diverted to a
-# stub that answers that everything is there. proot-bwrap is installed
-# beside this script's copy, or downloaded from the repository when run alone,
-# and Steam's own launcher is diverted so that every way of starting Steam --
-# the menu entry, a steam:// link, a shell -- names it. Without that, Steam's
-# requirements check finds no working bubblewrap and refuses to start with
-# "Steam now requires user namespaces to be enabled".
+# architectures). fakechroot is installed for the hosts that deny ptrace, and
+# proot -- what runs a program fakechroot cannot be preloaded into -- is built
+# here, since the packaged one is from 2018 and one that leaves its own loader
+# named in AT_EXECFN breaks every applet of the multi-call coreutils recent
+# Ubuntu ships. steamdeps, the client's dependency check, would drive apt
+# through pkexec at every start; the system carries what it checks for, so it
+# is diverted to a stub that answers that everything is there. proot-bwrap is
+# installed beside this script's copy, or downloaded from the repository when
+# run alone, and Steam's own launcher is diverted so that every way of
+# starting Steam -- the menu entry, a steam:// link, a shell -- names it.
+# Without that, Steam's requirements check finds no working bubblewrap and
+# refuses to start with "Steam now requires user namespaces to be enabled".
 #
 # Run as root, or under fakeroot in a rootless image build.
 
@@ -65,6 +68,42 @@ apt_install \
     libxss1:i386 \
     libasound2-plugins:i386 \
     python3
+
+# The fixes proot still lacks are offered upstream; a patch that is already
+# there applies in reverse and is skipped.
+patches="proot-freestanding-loader proot-own-auxv"
+tools=""
+for package in gcc libc6-dev make patch libtalloc-dev; do
+    dpkg-query -s "${package}:$(dpkg --print-architecture)" > /dev/null 2>&1 ||
+        tools="${tools} ${package}"
+done
+# shellcheck disable=SC2086  # the package list is meant to split
+apt_install libtalloc2 ${tools}
+
+curl -fsSL --retry 5 --retry-all-errors --retry-delay 3 --retry-connrefused --retry-max-time 180 \
+    "https://github.com/termux/proot/archive/refs/heads/master.tar.gz" | tar -xzf - -C /tmp
+srcdir=/tmp/proot-master
+
+for name in ${patches}; do
+    if [ -f "${here}/patches/${name}.patch" ]; then
+        cp "${here}/patches/${name}.patch" "/tmp/${name}.patch"
+    else
+        curl -o "/tmp/${name}.patch" -fsSL --retry 5 --retry-delay 3 --retry-connrefused --retry-max-time 180 \
+            "https://raw.githubusercontent.com/selkies-project/proot-bwrap/${ref}/patches/${name}.patch"
+    fi
+    ( cd "${srcdir}" &&
+        if ! patch -p1 -R --dry-run --silent < "/tmp/${name}.patch" > /dev/null 2>&1; then
+            patch -p1 --silent < "/tmp/${name}.patch"
+        fi )
+    rm -f "/tmp/${name}.patch"
+done
+
+make -C "${srcdir}/src" -j"$(nproc)" proot GIT=false
+install -m 755 "${srcdir}/src/proot" "${prefix}/bin/proot"
+rm -rf "${srcdir}"
+# shellcheck disable=SC2086  # likewise
+[ -z "${tools}" ] || apt-get purge -y ${tools}
+apt-get autoremove -y --purge
 
 if [ ! -e /usr/bin/steamdeps.distrib ]; then
     dpkg-divert --rename --divert /usr/bin/steamdeps.distrib /usr/bin/steamdeps
