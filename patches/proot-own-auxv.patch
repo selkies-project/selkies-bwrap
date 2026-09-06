@@ -28,7 +28,7 @@ index 348a1fd..e006f90 100644
  	if (tracee->skip_proot_loader) {
  		tracee->restore_original_regs = false;
 diff --git a/src/syscall/enter.c b/src/syscall/enter.c
-index 93f4306..13e5e7c 100644
+index 93f4306..42a9022 100644
 --- a/src/syscall/enter.c
 +++ b/src/syscall/enter.c
 @@ -21,6 +21,7 @@
@@ -39,7 +39,7 @@ index 93f4306..13e5e7c 100644
  #include <talloc.h>      /* talloc_*, */
  #include <sys/un.h>      /* struct sockaddr_un, */
  #include <linux/net.h>   /* SYS_*, */
-@@ -1808,6 +1809,98 @@ static void maybe_redirect_userns_file(Tracee *tracee, Reg reg)
+@@ -1808,6 +1809,100 @@ static void maybe_redirect_userns_file(Tracee *tracee, Reg reg)
  	(void) set_sysarg_path(tracee, "/dev/null", reg);
  }
  
@@ -78,7 +78,7 @@ index 93f4306..13e5e7c 100644
 + */
 +static void maybe_redirect_own_auxv(Tracee *tracee, const char *guest_path, Reg reg)
 +{
-+	uint8_t vector[1024];
++	uint8_t vector[4096];
 +	char host_path[64];
 +	size_t stride;
 +	size_t offset;
@@ -100,7 +100,9 @@ index 93f4306..13e5e7c 100644
 +			return;
 +		size = read(fd, vector, sizeof(vector));
 +		(void) close(fd);
-+		if (size <= 0)
++		/* A vector that fills the buffer may have been cut short, and a
++		 * cut one is worse than the kernel's own. */
++		if (size <= 0 || (size_t) size == sizeof(vector))
 +			return;
 +
 +		stride = sizeof_word(tracee);
@@ -138,7 +140,7 @@ index 93f4306..13e5e7c 100644
  /**
   * Translate the input arguments of the current @tracee's syscall in the
   * @tracee->pid process area. This function sets @tracee->status to
-@@ -2467,20 +2560,19 @@ int translate_syscall_enter(Tracee *tracee)
+@@ -2467,20 +2562,19 @@ int translate_syscall_enter(Tracee *tracee)
  	case PR_open:
  		flags = peek_reg(tracee, CURRENT, SYSARG_2);
  
@@ -165,7 +167,7 @@ index 93f4306..13e5e7c 100644
  		break;
  
  	case PR_fchownat:
-@@ -2608,18 +2700,15 @@ int translate_syscall_enter(Tracee *tracee)
+@@ -2608,18 +2702,15 @@ int translate_syscall_enter(Tracee *tracee)
  		if (status < 0)
  			break;
  
@@ -187,7 +189,7 @@ index 93f4306..13e5e7c 100644
  		break;
  
  	case PR_readlinkat:
-@@ -2842,10 +2931,6 @@ int translate_syscall_enter(Tracee *tracee)
+@@ -2842,10 +2933,6 @@ int translate_syscall_enter(Tracee *tracee)
  	case PR_close: {
  		int closed_fd = (int) peek_reg(tracee, CURRENT, SYSARG_1);
  
