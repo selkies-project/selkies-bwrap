@@ -68,7 +68,9 @@ falls back to this one.
   proot ignores cost nothing at all, and the number of binds barely matters.
   Chromium starts with two dozen threads and a burst of path syscalls, so a
   step the helper logs in 20 ms unconfined does not finish inside the ten
-  seconds. Games never hit this, and `PROOT_BWRAP_BACKEND=proot` still picks it.
+  seconds. Games never hit this, so the backend is chosen per container:
+  `PROOT_BWRAP_BACKEND=proot` runs the games under proot and the browser
+  helper under fakechroot, which is the only way the client starts.
 - **This is not a security boundary.** It confines paths, not privileges; the
   surrounding container is the boundary, as it already is for the browsers
   those images run with `--no-sandbox`.

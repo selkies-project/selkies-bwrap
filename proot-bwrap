@@ -325,8 +325,21 @@ def fakechroot_libraries():
     return found
 
 
-def choose_backend():
-    """Pick the executor: fakechroot, or proot where its library is missing.
+def steam_browser_helper(command):
+    """Whether this container holds the Steam client's browser helper.
+
+    It is the one container proot cannot run, so it is worth telling apart.
+    The name is matched as a prefix because the client runs the helper through
+    a per-runtime wrapper, `steamwebhelper_sniper_wrap.sh` today, which execs
+    the helper in place. This is the second and last thing here that knows
+    anything about Steam.
+    """
+    return any(os.path.basename(word).startswith("steamwebhelper")
+               for word in command)
+
+
+def choose_backend(command):
+    """Pick the executor for this container: fakechroot, or proot.
 
     Both run everything a game needs, and cost the same to within a few per
     cent of a game's own work. What separates them is a thread-heavy start
@@ -336,20 +349,26 @@ def choose_backend():
     syscalls it ignores are free and the bind count barely registers, so
     nothing tunes this away. The Steam client gives its browser helper, two
     dozen Chromium threads deep in path syscalls, about ten seconds to start,
-    and under proot it does not. So fakechroot leads and proot is what a host
-    without the library falls back to. proot confines paths for every process
-    rather than only those that go through libc, which is why
-    `PROOT_BWRAP_BACKEND=proot` stays available for a program that bypasses it.
+    and under proot it does not.
+
+    So fakechroot leads, and proot is what a host without the library falls
+    back to. The choice is per container rather than per run: proot asked for
+    by name still runs the browser helper under fakechroot, because proot
+    cannot run it at all, and everything else including games under proot,
+    which confines paths for every process rather than only those that go
+    through libc.
     """
     forced = os.environ.get("PROOT_BWRAP_BACKEND", "").strip().lower()
     if forced not in ("", "proot", "fakechroot"):
         raise UsageError("PROOT_BWRAP_BACKEND must be proot or fakechroot")
-    if forced != "proot":
-        libraries = fakechroot_libraries()
-        if libraries:
-            return "fakechroot", libraries
-        if forced == "fakechroot":
-            raise UsageError("libfakechroot.so is not installed")
+    libraries = fakechroot_libraries()
+    if libraries and (forced != "proot" or steam_browser_helper(command)):
+        if forced == "proot":
+            log("the browser helper runs under fakechroot, the only way it "
+                "starts in time")
+        return "fakechroot", libraries
+    if forced == "fakechroot":
+        raise UsageError("libfakechroot.so is not installed")
     fallback = None
     for path in proot_candidates():
         state = proot_state(path)
@@ -977,7 +996,7 @@ class Runner:
         That path is the tree under fakechroot and `/` under proot, so a prefix
         one executor created leaves the other unable to reach the game. The
         drive is rewritten to whatever this launch's root is, which is
-        Steam-specific knowledge, and the only knowledge of Steam here.
+        Steam-specific knowledge, as `steam_browser_helper` is.
         """
         data = self.env.get("STEAM_COMPAT_DATA_PATH")
         if not data:
@@ -1066,7 +1085,7 @@ def main(argv):
         ops, command = parse(argv[1:])
         if not command:
             raise UsageError("COMMAND is required")
-        backend, detail = choose_backend()
+        backend, detail = choose_backend(command)
     except UsageError as error:
         log(str(error))
         return 1
