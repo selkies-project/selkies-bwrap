@@ -60,10 +60,15 @@ falls back to this one.
   picked under `PROOT_BWRAP_DEBUG=1`.
 - **The Steam client wants fakechroot.** Both runtimes, both architectures,
   games and Proton run under either backend, but the client gives its browser
-  helper about ten seconds to answer and proot costs roughly twice as much for
-  every process started, which is enough to miss it. Nothing is broken there:
-  the same "Steamwebhelper is not responding" appears under fakechroot on a
-  machine slowed by that factor. `PROOT_BWRAP_BACKEND=proot` chooses it anyway.
+  helper about ten seconds to start and under proot it never gets there. One
+  proot process traces every thread of every process it runs, so the syscalls
+  it has to translate are served one at a time however many threads make them:
+  measured on 56 cores, 40k path syscalls a second on one thread and 63k on
+  twenty-four, where the same machine does 805k and 3.6M untraced. Syscalls
+  proot ignores cost nothing at all, and the number of binds barely matters.
+  Chromium starts with two dozen threads and a burst of path syscalls, so a
+  step the helper logs in 20 ms unconfined does not finish inside the ten
+  seconds. Games never hit this, and `PROOT_BWRAP_BACKEND=proot` still picks it.
 - **This is not a security boundary.** It confines paths, not privileges; the
   surrounding container is the boundary, as it already is for the browsers
   those images run with `--no-sandbox`.

@@ -329,15 +329,17 @@ def choose_backend():
     """Pick the executor: fakechroot, or proot where its library is missing.
 
     Both run everything a game needs, and cost the same to within a few per
-    cent of a game's own work, though proot pays about twice as much for every
-    process started. The Steam client is what separates them: it gives its
-    browser helper about ten seconds to answer, and that factor is enough to
-    miss it -- the same "not responding" appears under fakechroot on a machine
-    slowed as much -- so fakechroot leads and proot is what a host without the
-    library falls back to. proot confines
-    paths for every process rather than only those that go through libc, which
-    is why `PROOT_BWRAP_BACKEND=proot` stays available for a program that
-    bypasses it.
+    cent of a game's own work. What separates them is a thread-heavy start
+    under a deadline. One proot process traces every thread it runs, so the
+    syscalls it translates are served one at a time: 40k a second on one
+    thread and 63k on twenty-four, against 805k and 3.6M untraced. The
+    syscalls it ignores are free and the bind count barely registers, so
+    nothing tunes this away. The Steam client gives its browser helper, two
+    dozen Chromium threads deep in path syscalls, about ten seconds to start,
+    and under proot it does not. So fakechroot leads and proot is what a host
+    without the library falls back to. proot confines paths for every process
+    rather than only those that go through libc, which is why
+    `PROOT_BWRAP_BACKEND=proot` stays available for a program that bypasses it.
     """
     forced = os.environ.get("PROOT_BWRAP_BACKEND", "").strip().lower()
     if forced not in ("", "proot", "fakechroot"):
