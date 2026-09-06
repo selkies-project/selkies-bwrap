@@ -29,13 +29,13 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - name: Byte-compile
-        run: python -m py_compile selkies-bwrap
+        run: python -m py_compile proot-bwrap
       - name: Build a container and run a command in it
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y libfakechroot
           # shellcheck disable=SC2016  # the shell inside the container expands these
-          SELKIES_BWRAP_BACKEND=fakechroot python selkies-bwrap \
+          PROOT_BWRAP_BACKEND=fakechroot python proot-bwrap \
               --ro-bind /etc /etc --symlink usr/bin /bin --ro-bind /usr /usr \
               --bind /proc /proc --dev-bind /dev /dev --bind /home /home \
               --tmpfs /tmp --setenv CHECKED yes --chdir /usr \
@@ -50,7 +50,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install ruff
-      - run: ruff check selkies-bwrap
+      - run: ruff check proot-bwrap
       - name: Shell scripts
         run: |
           sudo apt-get update

@@ -22,7 +22,7 @@ force=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --backend) backend="$2"; shift 2 ;;
-        --proot) export SELKIES_BWRAP_PROOT="$2"; shift 2 ;;
+        --proot) export PROOT_BWRAP_PROOT="$2"; shift 2 ;;
         --force) force=yes; shift ;;
         --display) display="$2"; shift 2 ;;
         --home) home="$2"; shift 2 ;;
@@ -34,9 +34,9 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$home" ] || { echo "--home is required" >&2; exit 2; }
 export HOME="$home" DISPLAY="$display"
-export BWRAP="${BWRAP:-$(dirname "$(readlink -f "$0")")/selkies-bwrap}"
+export BWRAP="${BWRAP:-$(dirname "$(readlink -f "$0")")/proot-bwrap}"
 [ -z "$force" ] || export PRESSURE_VESSEL_BWRAP="$BWRAP"
-[ -z "$backend" ] || export SELKIES_BWRAP_BACKEND="$backend"
+[ -z "$backend" ] || export PROOT_BWRAP_BACKEND="$backend"
 common="$HOME/Steam/steamapps/common"
 soldier="$common/SteamLinuxRuntime_soldier/run"
 sniper="$common/SteamLinuxRuntime_sniper/run"
@@ -69,7 +69,7 @@ in_runtime() {
 }
 
 echo "== backend"
-out="$(SELKIES_BWRAP_DEBUG=1 "$BWRAP" --ro-bind / / /bin/true 2>&1 | grep -o 'backend [a-z]*')"
+out="$(PROOT_BWRAP_DEBUG=1 "$BWRAP" --ro-bind / / /bin/true 2>&1 | grep -o 'backend [a-z]*')"
 report $? shim "$out"
 
 # The command line Steam's own requirements check probes with, which has to

@@ -4,7 +4,7 @@
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-# Installs Steam and selkies-bwrap into a Debian-based image or system.
+# Installs Steam and proot-bwrap into a Debian-based image or system.
 #
 # Steam's launcher package comes from Valve's repository, which the package
 # itself registers, together with the 32-bit host libraries the 32-bit client
@@ -13,7 +13,7 @@
 # architectures). fakechroot is installed for the hosts that deny ptrace.
 # steamdeps, the client's dependency check, would drive apt through pkexec at
 # every start; the system carries what it checks for, so it is diverted to a
-# stub that answers that everything is there. selkies-bwrap is installed
+# stub that answers that everything is there. proot-bwrap is installed
 # beside this script's copy, or downloaded from the repository when run alone,
 # and Steam's own launcher is diverted so that every way of starting Steam --
 # the menu entry, a steam:// link, a shell -- names it. Without that, Steam's
@@ -25,7 +25,7 @@
 set -eu
 
 prefix="${PREFIX:-/usr/local}"
-ref="${SELKIES_BWRAP_REF:-main}"
+ref="${PROOT_BWRAP_REF:-main}"
 here="$(dirname "$(readlink -f "$0")")"
 export DEBIAN_FRONTEND=noninteractive
 
@@ -73,12 +73,12 @@ printf '#!/bin/sh\nexit 0\n' > /usr/bin/steamdeps
 chmod 755 /usr/bin/steamdeps
 
 mkdir -p "${prefix}/bin"
-if [ -f "${here}/selkies-bwrap" ]; then
-    install -m 755 "${here}/selkies-bwrap" "${prefix}/bin/selkies-bwrap"
+if [ -f "${here}/proot-bwrap" ]; then
+    install -m 755 "${here}/proot-bwrap" "${prefix}/bin/proot-bwrap"
 else
-    curl -o "${prefix}/bin/selkies-bwrap" -fsSL --retry 5 --retry-delay 3 --retry-connrefused --retry-max-time 180 \
-        "https://raw.githubusercontent.com/selkies-project/selkies-bwrap/${ref}/selkies-bwrap"
-    chmod 755 "${prefix}/bin/selkies-bwrap"
+    curl -o "${prefix}/bin/proot-bwrap" -fsSL --retry 5 --retry-delay 3 --retry-connrefused --retry-max-time 180 \
+        "https://raw.githubusercontent.com/selkies-project/proot-bwrap/${ref}/proot-bwrap"
+    chmod 755 "${prefix}/bin/proot-bwrap"
 fi
 
 # The launcher is a symbolic link to the client's own script; diverting it
@@ -95,7 +95,7 @@ fi
 cat > /usr/bin/steam <<EOF
 #!/bin/sh
 # Start Steam with a bubblewrap that works without user namespaces.
-BWRAP="\${BWRAP:-${prefix}/bin/selkies-bwrap}"
+BWRAP="\${BWRAP:-${prefix}/bin/proot-bwrap}"
 export BWRAP
 exec /usr/lib/steam/steam "\$@"
 EOF
@@ -103,4 +103,4 @@ chmod 755 /usr/bin/steam
 
 apt-get clean
 rm -rf /var/lib/apt/lists/*
-echo "selkies-bwrap installed at ${prefix}/bin/selkies-bwrap and wired into /usr/bin/steam"
+echo "proot-bwrap installed at ${prefix}/bin/proot-bwrap and wired into /usr/bin/steam"

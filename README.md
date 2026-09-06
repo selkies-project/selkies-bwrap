@@ -1,4 +1,4 @@
-# selkies-bwrap
+# proot-bwrap
 
 Steam, and every game it launches, inside a container that has no user namespaces.
 
@@ -16,7 +16,7 @@ user namespaces.
 ```
 
 pressure-vessel already looks for a bubblewrap replacement in `$BWRAP` when its own
-copy fails. `selkies-bwrap` takes that place. It accepts bubblewrap's command line,
+copy fails. `proot-bwrap` takes that place. It accepts bubblewrap's command line,
 materializes the container the arguments describe, and runs the command in it
 through [PRoot](https://proot-me.github.io/) or
 [fakechroot](https://github.com/dex4er/fakechroot) instead of namespaces. The Steam
@@ -35,7 +35,7 @@ sudo ./install.sh
 
 The script adds Valve's repository through Steam's own launcher package, installs
 the Steam client with the 32-bit libraries the client and games need, installs
-fakechroot, puts `selkies-bwrap` in `/usr/local/bin`, and diverts `/usr/bin/steam`
+fakechroot, puts `proot-bwrap` in `/usr/local/bin`, and diverts `/usr/bin/steam`
 so that every way of starting Steam names it: the menu entry, a `steam://` link, a
 shell. Nothing else to set. `$BWRAP` still wins where a session sets it.
 
@@ -48,18 +48,18 @@ In the Selkies desktop images
 [EGL](https://github.com/selkies-project/docker-selkies-egl-desktop)) the layer is:
 
 ```dockerfile
-ARG SELKIES_BWRAP_REF="main"
-RUN curl -fsSL "https://raw.githubusercontent.com/selkies-project/selkies-bwrap/${SELKIES_BWRAP_REF}/install.sh" | sh
+ARG PROOT_BWRAP_REF="main"
+RUN curl -fsSL "https://raw.githubusercontent.com/selkies-project/proot-bwrap/${PROOT_BWRAP_REF}/install.sh" | sh
 ```
 
 Those images already ship a PRoot that carries `CAP_SYS_PTRACE`
-(`/opt/proot-apps-cap/proot`), which `selkies-bwrap` finds on its own when it needs
+(`/opt/proot-apps-cap/proot`), which `proot-bwrap` finds on its own when it needs
 it.
 
 ## How it works
 
 The bubblewrap command line is a description of a container: bind mounts, symbolic
-links, generated files, environment edits, and the command to run. `selkies-bwrap`
+links, generated files, environment edits, and the command to run. `proot-bwrap`
 reads that description, builds the tree it describes as a real directory under
 `$XDG_RUNTIME_DIR`, and hands the result to one of two executors.
 
@@ -76,7 +76,7 @@ mode, which is what pressure-vessel picks anyway whenever the host's is newer th
 the runtime's.
 
 **PRoot** takes over where the fakechroot library is missing, and is available
-through `SELKIES_BWRAP_BACKEND=proot`. Every bind mount becomes a PRoot binding and
+through `PROOT_BWRAP_BACKEND=proot`. Every bind mount becomes a PRoot binding and
 the tree is the guest root, which confines paths for every process rather than only
 those that go through libc — the right answer for a program that bypasses it. Its
 `ptrace` needs a host that allows tracing: `kernel.yama.ptrace_scope` below 2, or
@@ -96,8 +96,8 @@ at the root of whichever one is running: a prefix built under one stays usable u
 the other. This is the only place where the stand-in knows anything about Steam.
 
 Two environment variables steer it, and neither is needed in normal use:
-`SELKIES_BWRAP_BACKEND` forces `proot` or `fakechroot`, and `SELKIES_BWRAP_DEBUG`
-prints the executor's command line. `SELKIES_BWRAP_PROOT` names a PRoot binary to
+`PROOT_BWRAP_BACKEND` forces `proot` or `fakechroot`, and `PROOT_BWRAP_DEBUG`
+prints the executor's command line. `PROOT_BWRAP_PROOT` names a PRoot binary to
 use instead of the ones found on the system.
 
 ## Proton

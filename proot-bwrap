@@ -35,8 +35,8 @@ executors.
   chooses whenever the host's is newer than the runtime's.
 
 Real bubblewrap is used whenever it works: pressure-vessel tries its own copy
-first and reads ``$BWRAP`` only after that fails. ``SELKIES_BWRAP_BACKEND``
-forces ``proot`` or ``fakechroot``; ``SELKIES_BWRAP_DEBUG`` prints the
+first and reads ``$BWRAP`` only after that fails. ``PROOT_BWRAP_BACKEND``
+forces ``proot`` or ``fakechroot``; ``PROOT_BWRAP_DEBUG`` prints the
 executor command line.
 """
 
@@ -52,8 +52,8 @@ import tempfile
 # launch runs this several times before anything starts, and neither module is
 # needed on the path that a launch actually takes.
 
-VERSION = "bubblewrap 0.9.0 (selkies-bwrap)"
-PROGRAM = "selkies-bwrap"
+VERSION = "bubblewrap 0.9.0 (proot-bwrap)"
+PROGRAM = "proot-bwrap"
 
 # Options with no argument: namespace and capability requests have no
 # meaning without namespaces and are accepted for compatibility.
@@ -103,7 +103,7 @@ def log(message):
 
 
 def debug(message):
-    if os.environ.get("SELKIES_BWRAP_DEBUG"):
+    if os.environ.get("PROOT_BWRAP_DEBUG"):
         log(message)
 
 
@@ -243,7 +243,7 @@ def collect_garbage(base):
 
 def proot_candidates():
     """proot executables to try, best first."""
-    override = os.environ.get("SELKIES_BWRAP_PROOT")
+    override = os.environ.get("PROOT_BWRAP_PROOT")
     if override:
         yield override
         return
@@ -291,12 +291,12 @@ def choose_backend():
     fakechroot the sign-in window is up in seconds, so fakechroot leads and
     proot is what a host without the library falls back to. proot confines
     paths for every process rather than only those that go through libc, which
-    is why `SELKIES_BWRAP_BACKEND=proot` stays available for a program that
+    is why `PROOT_BWRAP_BACKEND=proot` stays available for a program that
     bypasses it.
     """
-    forced = os.environ.get("SELKIES_BWRAP_BACKEND", "").strip().lower()
+    forced = os.environ.get("PROOT_BWRAP_BACKEND", "").strip().lower()
     if forced not in ("", "proot", "fakechroot"):
-        raise UsageError("SELKIES_BWRAP_BACKEND must be proot or fakechroot")
+        raise UsageError("PROOT_BWRAP_BACKEND must be proot or fakechroot")
     if forced != "proot":
         libraries = fakechroot_libraries()
         if libraries:
