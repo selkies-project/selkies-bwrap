@@ -19,22 +19,23 @@ The bwrap description is materialized as a root directory under the runtime
 directory: ``--dir``, ``--symlink``, ``--tmpfs`` and the data file options
 become real entries, and the bind mounts are handed to one of two executors.
 
-* fakechroot, the default: an LD_PRELOAD library prefixes every path a
-  dynamically linked program opens with the root directory, and binds become
-  symlinks in it. The dynamic loader and the kernel are not rewritten, so what
-  they follow must resolve on the host: library search paths are given as
-  root-prefixed host paths, absolute symlink targets inside the root are
+* proot, the default: every bind is a proot ``-b`` binding and the root
+  directory is the guest root, which confines paths for every process rather
+  than only those that go through libc. It needs ptrace, and it loads a
+  program through a loader of its own, whose temp file every released proot
+  leaves named in AT_EXECFN -- the multi-call coreutils of Ubuntu 25.10 and
+  later read that to decide which tool they are, so nothing that runs them
+  works under such a build. A proot is probed for that before it is used.
+* fakechroot, where no proot can do that: an LD_PRELOAD library prefixes every
+  path a dynamically linked program opens with the root directory, and binds
+  become symlinks in it. The dynamic loader and the kernel are not rewritten,
+  so what they follow must resolve on the host: library search paths are given
+  as root-prefixed host paths, absolute symlink targets inside the root are
   prefixed with it, and the ld.so cache regeneration is replaced by a complete
   LD_LIBRARY_PATH. The host's glibc is what the container runs on in this mode,
   which pressure-vessel already chooses whenever the host's is newer than the
-  runtime's.
-* proot, where that library is missing: every bind is a proot ``-b`` binding
-  and the root directory is the guest root, which confines paths for every
-  process rather than only those that go through libc. It needs ptrace, and it
-  loads a program through a loader of its own, whose temp file every released
-  proot leaves named in AT_EXECFN -- the multi-call coreutils of Ubuntu 25.10
-  and later read that to decide which tool they are, so nothing that runs them
-  works under such a build. A proot is probed for that before it is used.
+  runtime's. It also runs the one container proot cannot, the Steam client's
+  browser helper, whatever the rest of the launch uses.
 
 Real bubblewrap is used whenever it works: pressure-vessel tries its own copy
 first and reads ``$BWRAP`` only after that fails. ``PROOT_BWRAP_BACKEND``
@@ -339,49 +340,56 @@ def steam_browser_helper(command):
 
 
 def choose_backend(command):
-    """Pick the executor for this container: fakechroot, or proot.
+    """Pick the executor for this container: proot, or fakechroot.
 
-    Both run everything a game needs, and cost the same to within a few per
-    cent of a game's own work. What separates them is a thread-heavy start
-    under a deadline. One proot process traces every thread it runs, so the
-    syscalls it translates are served one at a time: 40k a second on one
-    thread and 63k on twenty-four, against 805k and 3.6M untraced. The
-    syscalls it ignores are free and the bind count barely registers, so
-    nothing tunes this away. The Steam client gives its browser helper, two
-    dozen Chromium threads deep in path syscalls, about ten seconds to start,
-    and under proot it does not.
+    proot leads because it confines paths for every process rather than only
+    those that go through libc, and it costs a few per cent of a game's own
+    work. fakechroot takes over where no proot can trace, or where the only
+    proot available leaves its loader named in AT_EXECFN.
 
-    So fakechroot leads, and proot is what a host without the library falls
-    back to. The choice is per container rather than per run: proot asked for
-    by name still runs the browser helper under fakechroot, because proot
-    cannot run it at all, and everything else including games under proot,
-    which confines paths for every process rather than only those that go
-    through libc.
+    The choice is per container, because one container cannot use proot at
+    all. One proot process traces every thread it runs, so the syscalls it
+    translates are served one at a time: 40k a second on one thread and 63k on
+    twenty-four, against 805k and 3.6M untraced. The syscalls it ignores are
+    free and the bind count barely registers, so nothing tunes this away. The
+    Steam client gives its browser helper, two dozen Chromium threads deep in
+    path syscalls, about ten seconds to start, and under proot it does not.
+    So the helper runs under fakechroot however the rest of the launch runs.
     """
     forced = os.environ.get("PROOT_BWRAP_BACKEND", "").strip().lower()
     if forced not in ("", "proot", "fakechroot"):
         raise UsageError("PROOT_BWRAP_BACKEND must be proot or fakechroot")
     libraries = fakechroot_libraries()
-    if libraries and (forced != "proot" or steam_browser_helper(command)):
+    if libraries and steam_browser_helper(command):
         if forced == "proot":
             log("the browser helper runs under fakechroot, the only way it "
                 "starts in time")
+        else:
+            debug("the browser helper runs under fakechroot")
         return "fakechroot", libraries
     if forced == "fakechroot":
+        if libraries:
+            return "fakechroot", libraries
         raise UsageError("libfakechroot.so is not installed")
-    fallback = None
+    stale = None
     for path in proot_candidates():
         state = proot_state(path)
         if state == "names":
             return "proot", path
         if state == "traces":
             debug(f"{path} leaves its own loader named in AT_EXECFN")
-            fallback = fallback or path
+            stale = stale or path
         else:
             debug(f"{path} cannot trace processes here")
-    if fallback is not None:
-        return "proot", fallback
-    raise UsageError("neither libfakechroot.so is installed nor can proot trace here")
+    # A proot that misnames the loader breaks the multi-call coreutils of
+    # current releases, so a working fakechroot is worth more than it is.
+    if libraries and forced != "proot":
+        return "fakechroot", libraries
+    if stale is not None:
+        return "proot", stale
+    if libraries:
+        return "fakechroot", libraries
+    raise UsageError("neither proot can trace here nor is libfakechroot.so installed")
 
 
 class Root:

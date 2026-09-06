@@ -41,11 +41,11 @@ titles under `Steam > Settings > Compatibility` to choose a Proton version.
 Steam's container is described by a bubblewrap command line: bind mounts,
 symbolic links, generated files, and the command to run. `proot-bwrap` reads
 that description, builds the tree it describes under `$XDG_RUNTIME_DIR`, and
-runs the command in it with [fakechroot](https://github.com/dex4er/fakechroot),
-which redirects the paths a program opens instead of creating a namespace.
-[PRoot](https://proot-me.github.io/), which traces every process rather than
-only what goes through libc, runs a program the fakechroot library cannot be
-preloaded into.
+runs the command in it with [PRoot](https://proot-me.github.io/), which traces
+every process and redirects the paths it opens instead of creating a namespace.
+Where no PRoot can trace, [fakechroot](https://github.com/dex4er/fakechroot)
+does the same for the programs that go through libc. It also runs the Steam
+client's browser helper, which PRoot cannot start in time.
 
 Real bubblewrap is still preferred: Steam tries its own copy first and only
 falls back to this one.
@@ -58,7 +58,7 @@ falls back to this one.
   `coreutils: unknown program`. The installer builds one that answers with the
   program's own name; `proot-bwrap` prefers such a build, and says which it
   picked under `PROOT_BWRAP_DEBUG=1`.
-- **The Steam client wants fakechroot.** Both runtimes, both architectures,
+- **The browser helper is the one thing PRoot cannot run.** Both runtimes, both architectures,
   games and Proton run under either backend, but the client gives its browser
   helper about ten seconds to start and under proot it never gets there. One
   proot process traces every thread of every process it runs, so the syscalls
@@ -68,9 +68,9 @@ falls back to this one.
   proot ignores cost nothing at all, and the number of binds barely matters.
   Chromium starts with two dozen threads and a burst of path syscalls, so a
   step the helper logs in 20 ms unconfined does not finish inside the ten
-  seconds. Games never hit this, so the backend is chosen per container:
-  `PROOT_BWRAP_BACKEND=proot` runs the games under proot and the browser
-  helper under fakechroot, which is the only way the client starts.
+  seconds. Games never hit this, so the backend is chosen per container: the
+  helper runs under fakechroot and everything else under PRoot. Set
+  `PROOT_BWRAP_BACKEND=fakechroot` to put the whole launch on fakechroot.
 - **This is not a security boundary.** It confines paths, not privileges; the
   surrounding container is the boundary, as it already is for the browsers
   those images run with `--no-sandbox`.
