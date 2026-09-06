@@ -16,23 +16,26 @@ program takes that place, accepts the same command line and runs the command
 in an equivalent tree without namespaces.
 
 The bwrap description is materialized as a root directory under the runtime
-directory, one per launch: ``--dir``, ``--symlink``, ``--tmpfs`` and the data
-file options become real entries, and the bind mounts are handed to one of two
-executors.
+directory: ``--dir``, ``--symlink``, ``--tmpfs`` and the data file options
+become real entries, and the bind mounts are handed to one of two executors.
 
-* proot, when the host allows ptrace: every bind is a proot ``-b`` binding and
-  the root directory is the guest root, which is a faithful container. proot's
-  seccomp filter leaves syscalls without a path argument untraced, so a game's
-  frame loop runs at native speed.
-* fakechroot, when ptrace is denied (Yama scope 2 without CAP_SYS_PTRACE): an
-  LD_PRELOAD library prefixes every path a dynamically linked program opens
-  with the root directory, and binds become symlinks in it. The dynamic loader
-  and the kernel are not rewritten, so what they follow must resolve on the
-  host: library search paths are given as root-prefixed host paths, absolute
-  symlink targets inside the root are prefixed with it, and the ld.so cache
-  regeneration is replaced by a complete LD_LIBRARY_PATH. The host's glibc is
-  what the container runs on in this mode, which pressure-vessel already
-  chooses whenever the host's is newer than the runtime's.
+* fakechroot, the default: an LD_PRELOAD library prefixes every path a
+  dynamically linked program opens with the root directory, and binds become
+  symlinks in it. The dynamic loader and the kernel are not rewritten, so what
+  they follow must resolve on the host: library search paths are given as
+  root-prefixed host paths, absolute symlink targets inside the root are
+  prefixed with it, and the ld.so cache regeneration is replaced by a complete
+  LD_LIBRARY_PATH. The host's glibc is what the container runs on in this mode,
+  which pressure-vessel already chooses whenever the host's is newer than the
+  runtime's.
+* proot, where that library is missing: every bind is a proot ``-b`` binding
+  and the root directory is the guest root, which confines paths for every
+  process rather than only those that go through libc. It needs ptrace, and it
+  replaces argv[0] with its loader, which breaks a multi-call binary that reads
+  argv[0] to decide what it is -- the coreutils of Ubuntu 25.10 and later are
+  one, so nothing that runs them works under proot on such a host. Inside the
+  Steam runtimes, which are Debian-based, they are separate binaries and it
+  does work.
 
 Real bubblewrap is used whenever it works: pressure-vessel tries its own copy
 first and reads ``$BWRAP`` only after that fails. ``PROOT_BWRAP_BACKEND``
@@ -324,6 +327,8 @@ class Root:
         self.fakechroot = fakechroot
         self.binds = []
         self.excluded = ["/dev", "/proc", "/sys"]
+        # Top-level names a later operation writes under, filled in by apply()
+        self.built_on = set()
         self.counter = 0
         os.mkdir(self.path, 0o755)
 
@@ -357,7 +362,10 @@ class Root:
         itself, since a pass-through path matches at a directory boundary, so
         the host's own top-level entries are linked into the tree instead and
         the container becomes the host filesystem, which is what binding the
-        root asks for.
+        root asks for. Each of those links is passed through as well, or the
+        link and the translation of its target would resolve into each other
+        until the path resolver gives up. An entry a later operation builds on
+        keeps the link without the pass-through, so that operation still lands.
         """
         dest = os.path.normpath(dest)
         if dest == "/":
@@ -365,6 +373,8 @@ class Root:
                 here = os.path.join(self.path, name)
                 if not os.path.lexists(here):
                     os.symlink("/" + name, here)
+                if "/" + name not in self.built_on:
+                    self.excluded.append("/" + name)
             return
         if self.excluded_path(dest):
             return
@@ -553,6 +563,12 @@ class Root:
 
     def apply(self, ops):
         """Apply the filesystem operations in order; the rest is for the runner."""
+        for _, values, _ in ops:
+            for value in values:
+                if value.startswith("/"):
+                    parts = [p for p in value.split("/") if p]
+                    if len(parts) > 1:
+                        self.built_on.add("/" + parts[0])
         for option, values, perms in ops:
             if option in BINDS:
                 self.bind(option, values[0], values[1])
