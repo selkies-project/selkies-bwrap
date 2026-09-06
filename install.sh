@@ -102,8 +102,7 @@ make -C "${srcdir}/src" -j"$(nproc)" proot GIT=false
 install -m 755 "${srcdir}/src/proot" "${prefix}/bin/proot"
 rm -rf "${srcdir}"
 # shellcheck disable=SC2086  # likewise
-[ -z "${tools}" ] || apt-get purge -y ${tools}
-apt-get autoremove -y --purge
+[ -z "${tools}" ] || { apt-get purge -y ${tools} && apt-get autoremove -y --purge; }
 
 if [ ! -e /usr/bin/steamdeps.distrib ]; then
     dpkg-divert --rename --divert /usr/bin/steamdeps.distrib /usr/bin/steamdeps
